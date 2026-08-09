@@ -6,7 +6,7 @@ from django.db import transaction
 
 def handle_zimna_logic(user, conversation, raw_text):
     provider = GeminiProvider()
-    workflow = ZimnaWorkflow()
+    workflow = ZimnaWorkflow(provider=provider)
 
     # Save User Message immediately (No transaction here - save it immediately)
     Message.objects.create(conversation=conversation, role='user', content=raw_text)
@@ -35,7 +35,7 @@ def handle_zimna_logic(user, conversation, raw_text):
     # Save AI Response
     ai_message = Message.objects.create(
         conversation=conversation, 
-        role='model', 
+        role='assistant',
         content=response_text
     )
 
