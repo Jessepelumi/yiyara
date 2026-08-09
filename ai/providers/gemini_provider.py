@@ -1,15 +1,25 @@
 from google import genai
 from google.genai import types
-from django.conf import settings
 import os
 import logging
 
+from ai.prompts.goal_decomposition_prompt import GOAL_DECOMPOSITION_SCHEMA
+
 logger = logging.getLogger(__name__)
 
+
+class GeminiConfigurationError(RuntimeError):
+    pass
+
+
 class GeminiProvider:
-    def __init__(self):
-        self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        self.model_name = "gemini-3-flash-preview"
+    def __init__(self, api_key=None):
+        api_key = api_key or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise GeminiConfigurationError("GEMINI_API_KEY is not configured")
+
+        self.client = genai.Client(api_key=api_key)
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
     def generate_response(self, prompt, history=None):
         try:
@@ -31,7 +41,8 @@ class GeminiProvider:
                 model=self.model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
+                    response_mime_type="application/json",
+                    response_json_schema=GOAL_DECOMPOSITION_SCHEMA,
                 )
             )
             return response.text
@@ -75,4 +86,3 @@ class GeminiProvider:
         except Exception as e:
             logger.error(f"Classification Error: {e}")
             return 'CHAT' # Fallback to chat so the user isn't stuck
-    
