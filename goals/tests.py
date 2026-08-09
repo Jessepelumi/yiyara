@@ -5,7 +5,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
-from conversations.models import Message
+from conversations.models import Conversation, Message
 from goals.models import Goal
 from tasks.models import Task
 from ai.providers.gemini_provider import GeminiConfigurationError
@@ -121,6 +121,28 @@ class GoalApiTests(TestCase):
         self.assertEqual(len(list_response.data), 1)
         self.assertEqual(list_response.data[0]["title"], "Launch portfolio")
         self.assertEqual(len(list_response.data[0]["tasks"]), 2)
+
+    def test_guest_can_preview_decomposition_without_persisting(self):
+        self.client.force_authenticate(user=None)
+
+        with patch(
+            "workflow.ai_engine.GeminiProvider",
+            return_value=StubProvider(VALID_DECOMPOSITION),
+        ):
+            response = self.client.post(
+                "/api/decompose/preview/",
+                {"text": "Build my portfolio"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data[0]["title"], "Launch portfolio")
+        self.assertEqual(len(response.data[0]["tasks"]), 2)
+        self.assertNotIn("id", response.data[0])
+        self.assertFalse(Goal.objects.exists())
+        self.assertFalse(Task.objects.exists())
+        self.assertFalse(Conversation.objects.exists())
+        self.assertFalse(Message.objects.exists())
 
     def test_invalid_ai_output_returns_error_and_does_not_persist(self):
         with patch(
