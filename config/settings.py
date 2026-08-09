@@ -151,6 +151,9 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
+    'DEFAULT_THROTTLE_RATES': {
+        'goal_preview': '10/hour',
+    },
 }
 
 # JWT Settings
