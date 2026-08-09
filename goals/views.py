@@ -1,14 +1,11 @@
-from django.shortcuts import render
 from rest_framework.views import APIView
 from rest_framework.generics import ListAPIView
 from rest_framework.response import Response
-from rest_framework import status
 from django.shortcuts import get_object_or_404
 from rest_framework import status, permissions
 from workflow import ai_engine
-from .serializers import GoalSerializer
+from .serializers import DecomposeGoalRequestSerializer, GoalSerializer
 from .models import Goal
-import os
 import logging
 
 logger = logging.getLogger(__name__)
@@ -17,35 +14,31 @@ class DecomposeGoalView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        raw_input = request.data.get('text')
-
-        if not raw_input:
-            return Response(
-                {"error": "No text provided"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Initialize workflow with Gemini key
-        api_key = os.environ.get('GEMINI_API_KEY')
-        workflow = ai_engine.ZimnaWorkflow(api_key=api_key)
+        request_serializer = DecomposeGoalRequestSerializer(data=request.data)
+        request_serializer.is_valid(raise_exception=True)
+        raw_input = request_serializer.validated_data['text']
 
         try:
+            workflow = ai_engine.ZimnaWorkflow()
             created_goals = workflow.create_goals_from_ai(request.user, raw_input)
-
-            # Check for clarification error
-            if isinstance(created_goals, list) and len(created_goals) > 0:
-                if isinstance(created_goals[0], dict) and "error" in created_goals[0]:
-                    return Response(created_goals[0], status=status.HTTP_200_OK)
-
-            if not isinstance(created_goals, list):
-                created_goals = [created_goals]
-            
             serializer = GoalSerializer(created_goals, many=True)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
-        
-        except Exception as e:
+
+        except ai_engine.GeminiConfigurationError as exc:
             return Response(
-                {"error": "AI Processing Failed", "details": str(e)},
+                {"error": "ai_not_configured", "message": str(exc)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except ai_engine.GoalDecompositionError as exc:
+            logger.warning("Goal decomposition failed for user %s: %s", request.user.id, exc)
+            return Response(
+                {"error": "goal_decomposition_failed", "message": str(exc)},
+                status=status.HTTP_502_BAD_GATEWAY
+            )
+        except Exception:
+            logger.exception("Unexpected goal decomposition failure for user %s", request.user.id)
+            return Response(
+                {"error": "goal_decomposition_failed", "message": "Unexpected server error"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 

@@ -1,10 +1,11 @@
-from django.shortcuts import render
+import secrets
+
+from django.conf import settings
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status, permissions
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import get_user_model
-import os
 
 User = get_user_model()
 
@@ -17,7 +18,13 @@ class InternalAuthView(APIView):
 
     def post(self, request):
         internal_secret = request.headers.get("X-Internal-Secret")
-        if internal_secret != os.getenv("INTERNAL_AUTH_SECRET"):
+        expected_secret = settings.INTERNAL_AUTH_SECRET
+        if not expected_secret:
+            return Response(
+                {"error": "Internal authentication is not configured"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        if not internal_secret or not secrets.compare_digest(internal_secret, expected_secret):
             return Response({"error": "Unauthorized internal request"}, status=status.HTTP_401_UNAUTHORIZED)
         
         email = request.data.get("email")
