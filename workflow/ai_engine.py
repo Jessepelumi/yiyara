@@ -28,6 +28,12 @@ class ZimnaWorkflow:
         The main entry point. Orchestrates AI decomposition and DB persistence.
         """
 
+        goal_data = self.decompose_goal(raw_input)
+        return self._persist_to_db(user, raw_input, goal_data)
+
+    def decompose_goal(self, raw_input):
+        """Return a validated decomposition without writing anything to the DB."""
+
         # Prepare the dynamic prompt
         full_prompt = f"{DECOMPOSITION_SYSTEM_PROMPT}\n\nUser Input: '{raw_input}'\nCurrent Date: {timezone.now().date()}"
 
@@ -55,7 +61,7 @@ class ZimnaWorkflow:
             logger.exception("Goal decomposition provider failed")
             raise GoalDecompositionError("AI provider failed") from exc
 
-        return self._persist_to_db(user, raw_input, serializer.validated_data)
+        return serializer.validated_data
 
 
     def _persist_to_db(self, user, raw_input, goal_data_list):

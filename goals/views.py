@@ -1,14 +1,55 @@
 from rest_framework.views import APIView
 from rest_framework.generics import ListAPIView
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from django.shortcuts import get_object_or_404
 from rest_framework import status, permissions
 from workflow import ai_engine
-from .serializers import DecomposeGoalRequestSerializer, GoalSerializer
+from .serializers import (
+    DecomposeGoalRequestSerializer,
+    GoalDecompositionSerializer,
+    GoalSerializer,
+)
 from .models import Goal
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class PreviewDecomposeGoalView(APIView):
+    """Generate a validated goal preview without creating database records."""
+
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "goal_preview"
+
+    def post(self, request):
+        request_serializer = DecomposeGoalRequestSerializer(data=request.data)
+        request_serializer.is_valid(raise_exception=True)
+        raw_input = request_serializer.validated_data["text"]
+
+        try:
+            workflow = ai_engine.ZimnaWorkflow()
+            goal_data = workflow.decompose_goal(raw_input)
+            response_serializer = GoalDecompositionSerializer(goal_data, many=True)
+            return Response(response_serializer.data, status=status.HTTP_200_OK)
+        except ai_engine.GeminiConfigurationError as exc:
+            return Response(
+                {"error": "ai_not_configured", "message": str(exc)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except ai_engine.GoalDecompositionError as exc:
+            logger.warning("Anonymous goal preview failed: %s", exc)
+            return Response(
+                {"error": "goal_decomposition_failed", "message": str(exc)},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except Exception:
+            logger.exception("Unexpected anonymous goal preview failure")
+            return Response(
+                {"error": "goal_decomposition_failed", "message": "Unexpected server error"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 class DecomposeGoalView(APIView):
     permission_classes = [permissions.IsAuthenticated]
