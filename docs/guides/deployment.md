@@ -1,6 +1,6 @@
 # Deployment Guide
 
-This guide covers deploying the Zimna application to production.
+This guide covers deploying the Yiyara application to production.
 
 ## Prerequisites
 
@@ -178,8 +178,8 @@ http {
 
 ```bash
 # Clone repository
-git clone https://github.com/your-username/zimna.git
-cd zimna
+git clone https://github.com/your-username/yiyara.git
+cd yiyara
 
 # Create production env file
 cp .env.example .env.prod
@@ -319,4 +319,4 @@ docker-compose -f docker-compose.prod.yml logs -f backend
 - Configure firewall rules
 - Regular security audits
 - Monitor for vulnerabilities</content>
-  <parameter name="filePath">/Users/jeolad/Documents/zimna/docs/guides/deployment.md
+  <parameter name="filePath">/Users/jeolad/Documents/yiyara/docs/guides/deployment.md

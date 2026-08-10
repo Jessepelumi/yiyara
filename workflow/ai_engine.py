@@ -5,7 +5,8 @@ from django.utils import timezone
 from django.db import transaction
 from rest_framework import serializers
 
-from goals.models import Goal # Goal model
+from goals.models import Goal, Plan
+from goals.services import create_plan_revision
 from goals.serializers import GoalDecompositionSerializer
 from tasks.models import Task # Task model
 from ai.providers.gemini_provider import GeminiConfigurationError, GeminiProvider
@@ -19,17 +20,19 @@ class GoalDecompositionError(Exception):
     """Raised when the AI cannot produce a valid, persistable decomposition."""
 
 
-class ZimnaWorkflow:
+class YiyaraWorkflow:
     def __init__(self, api_key=None, provider=None):
         self.provider = provider or GeminiProvider(api_key=api_key)
 
-    def create_goals_from_ai(self, user, raw_input):
-        """
-        The main entry point. Orchestrates AI decomposition and DB persistence.
-        """
-
+    def create_plan_from_ai(self, user, raw_input):
+        """Decompose one ambition and persist one shared drawing board."""
         goal_data = self.decompose_goal(raw_input)
-        return self._persist_to_db(user, raw_input, goal_data)
+        return self.persist_plan(user, raw_input, goal_data)
+
+    def create_goals_from_ai(self, user, raw_input):
+        """Backward-compatible command entry point returning created goals."""
+        plan = self.create_plan_from_ai(user, raw_input)
+        return list(plan.goals.prefetch_related("tasks").order_by("created_at"))
 
     def decompose_goal(self, raw_input):
         """Return a validated decomposition without writing anything to the DB."""
@@ -64,22 +67,27 @@ class ZimnaWorkflow:
         return serializer.validated_data
 
 
-    def _persist_to_db(self, user, raw_input, goal_data_list):
+    @staticmethod
+    def persist_plan(user, raw_input, goal_data_list, title=None):
         created_goals = []
         
         with transaction.atomic():
+            plan = Plan.objects.create(
+                user=user,
+                title=(title or raw_input)[:255],
+                raw_input=raw_input,
+            )
+
             for item in goal_data_list:
-                # Create the Goal
                 new_goal = Goal.objects.create(
+                    plan=plan,
                     user=user,
                     title=item.get('title', 'Untitled Goal'),
                     description=item.get('description', ''),
-                    # raw_input helps us track what started this goal
                     raw_input=raw_input, 
                     due_date=item.get('due_date') if item.get('due_date') else None
                 )
 
-                # Create associated Tasks
                 tasks_to_create = [
                     Task(
                         goal=new_goal,
@@ -92,14 +100,15 @@ class ZimnaWorkflow:
 
                 created_goals.append(new_goal)
 
-            # Associate the conversation with the FIRST goal created for the chat context
-            if created_goals:
-                primary_goal = created_goals[0]
-                conversation, _ = Conversation.objects.get_or_create(goal=primary_goal, user=user)
-                Message.objects.create(
-                    conversation=conversation,
-                    role='assistant',
-                    content=f"I've successfully broken down '{primary_goal.title}' into actionable steps! How would you like to start?"
-                )
+            conversation = Conversation.objects.create(plan=plan, user=user)
+            Message.objects.create(
+                conversation=conversation,
+                role='assistant',
+                content=(
+                    f"I've broken this ambition into {len(created_goals)} goals. "
+                    "Select a goal or discuss the whole board."
+                ),
+            )
+            create_plan_revision(plan, "Initial decomposition")
 
-        return created_goals
+        return plan

@@ -91,4 +91,4 @@ docker-compose logs frontend
 - Review the [API Documentation](api.md) for available endpoints
 - Set up [AI Configuration](ai-configuration.md) for advanced features
 - Check the [Deployment Guide](deployment.md) for production setup</content>
-  <parameter name="filePath">/Users/jeolad/Documents/zimna/docs/guides/setup.md
+  <parameter name="filePath">/Users/jeolad/Documents/yiyara/docs/guides/setup.md

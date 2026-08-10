@@ -5,7 +5,7 @@ FRONTEND_SVC=frontend
 
 # Help System
 help:
-	@echo "Zimna AI Development Commands:"
+	@echo "Yiyara AI Development Commands:"
 	@echo "  make up         - Start all containers"
 	@echo "  make down       - Stop all containers"
 	@echo "  make build      - Rebuild containers (no cache)"

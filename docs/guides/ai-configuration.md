@@ -1,10 +1,10 @@
 # AI Configuration Guide
 
-This guide explains how to configure AI providers for the Zimna project.
+This guide explains how to configure AI providers for the Yiyara project.
 
 ## Supported AI Providers
 
-Zimna currently supports:
+Yiyara currently supports:
 
 - Google Gemini (primary)
 - OpenAI ChatGPT (alternative)
@@ -105,4 +105,4 @@ For custom AI behavior, modify:
 - `backend/ai/providers/gemini_provider.py` - Gemini integration
 - `backend/ai/providers/chatgpt_provider.py` - ChatGPT integration
 - `backend/workflow/ai_engine.py` - Main AI orchestration logic</content>
-  <parameter name="filePath">/Users/jeolad/Documents/zimna/docs/guides/ai-configuration.md
+  <parameter name="filePath">/Users/jeolad/Documents/yiyara/docs/guides/ai-configuration.md

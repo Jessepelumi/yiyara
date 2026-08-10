@@ -1,6 +1,6 @@
 # API Documentation
 
-This guide documents the Zimna REST API endpoints.
+This guide documents the Yiyara REST API endpoints.
 
 ## Base URL
 
@@ -169,4 +169,4 @@ Planned additions:
 - Goal update/completion
 - User authentication endpoints
 - Progress tracking</content>
-  <parameter name="filePath">/Users/jeolad/Documents/zimna/docs/guides/api.md
+  <parameter name="filePath">/Users/jeolad/Documents/yiyara/docs/guides/api.md

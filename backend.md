@@ -1,15 +1,15 @@
-# Zimna Backend Architecture
+# Yiyara Backend Architecture
 
-This document explains the backend architecture of the Zimna project, including how each part of the system connects and what each component does.
+This document explains the backend architecture of the Yiyara project, including how each part of the system connects and what each component does.
 
 ## Overview
 
-Zimna is an AI-powered life planning and goal management platform. The backend is built with Django and Django REST Framework, and it provides APIs for user authentication, goal creation, task management, and chat-based AI interaction.
+Yiyara is an AI-powered life planning and goal management platform. The backend is built with Django and Django REST Framework, and it provides APIs for user authentication, goal creation, task management, and chat-based AI interaction.
 
 ## Project Structure
 
 ```
-zimna-backend/
+yiyara-backend/
 ├── manage.py
 ├── Dockerfile
 ├── README.md
@@ -80,7 +80,7 @@ This app manages chat conversations between users and the AI assistant.
 - `views.py` — Contains two main views:
   - `ChatAPIView` — Receives chat messages, ensures a conversation exists, and routes the message to AI handling logic.
   - `ConversationHistoryView` — Retrieves the message history for a specific goal's conversation.
-- `services.py` — Contains `handle_zimna_logic`, which classifies intent, persists chat messages, and generates AI responses.
+- `services.py` — Contains `handle_yiyara_logic`, which classifies intent, persists chat messages, and generates AI responses.
 - `urls.py` — Registers the chat and history endpoints.
 - `migrations/` — Database migration files for conversation and message models.
 
@@ -88,7 +88,7 @@ This app manages chat conversations between users and the AI assistant.
 
 This package contains the shared AI orchestration logic.
 
-- `ai_engine.py` — Defines `ZimnaWorkflow`, the class responsible for converting raw user input into structured goals and tasks using AI.
+- `ai_engine.py` — Defines `YiyaraWorkflow`, the class responsible for converting raw user input into structured goals and tasks using AI.
 
 ### `ai/`
 
@@ -105,7 +105,7 @@ This package contains provider wrappers and prompt definitions for AI.
 ```mermaid
 flowchart TD
   A[Frontend Request] -->|POST /api/decompose/| B[goals.views.DecomposeGoalView]
-  B --> C[ZimnaWorkflow.create_goals_from_ai()]
+  B --> C[YiyaraWorkflow.create_goals_from_ai()]
   C --> D[GeminiProvider.generate_structured_response()]
   D --> E[Parse AI JSON into goals/tasks]
   E --> F[Save Goal and Task models to DB]
@@ -143,8 +143,8 @@ flowchart TD
 ### Goal Creation and AI Decomposition
 
 1. The frontend sends raw text to `POST /api/decompose/`.
-2. `goals.views.DecomposeGoalView` validates the request and instantiates `ZimnaWorkflow`.
-3. `ZimnaWorkflow.create_goals_from_ai()` builds a prompt using `DECOMPOSITION_SYSTEM_PROMPT`.
+2. `goals.views.DecomposeGoalView` validates the request and instantiates `YiyaraWorkflow`.
+3. `YiyaraWorkflow.create_goals_from_ai()` builds a prompt using `DECOMPOSITION_SYSTEM_PROMPT`.
 4. It calls `GeminiProvider.generate_structured_response()` to get JSON output from Gemini AI.
 5. The response is parsed into goal and task objects.
 6. Goals and tasks are stored in the database using Django models.
@@ -168,9 +168,9 @@ flowchart TD
 
 1. The frontend sends a chat message to `POST /api/conversations/chat/` with either `goal_id` or `conversation_id`.
 2. `conversations.views.ChatAPIView` retrieves or creates the `Conversation`.
-3. `conversations.services.handle_zimna_logic()` stores the user message.
+3. `conversations.services.handle_yiyara_logic()` stores the user message.
 4. It classifies the intent using `GeminiProvider.classify_intent()`.
-5. If the intent is `DECOMPOSE`, it uses `ZimnaWorkflow` to create goals from the chat text.
+5. If the intent is `DECOMPOSE`, it uses `YiyaraWorkflow` to create goals from the chat text.
 6. If the intent is `QUERY`, it returns a placeholder response.
 7. If the intent is `CHAT`, it builds chat history and calls `GeminiProvider.generate_response()`.
 8. The AI response is saved as a `Message` and returned.
@@ -215,4 +215,4 @@ flowchart TD
 
 ## Summary
 
-This document is intended to help any developer understand how the Zimna backend is organized, what each app does, and how the components interact to support AI-driven goal decomposition, task management, and conversations.
+This document is intended to help any developer understand how the Yiyara backend is organized, what each app does, and how the components interact to support AI-driven goal decomposition, task management, and conversations.

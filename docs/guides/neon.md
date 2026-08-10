@@ -1,4 +1,4 @@
-# Connect Zimna to Neon Postgres
+# Connect Yiyara to Neon Postgres
 
 This guide explains how to connect the project to Neon Postgres.
 

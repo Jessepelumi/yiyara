@@ -4,6 +4,7 @@ import os
 import logging
 
 from ai.prompts.goal_decomposition_prompt import GOAL_DECOMPOSITION_SCHEMA
+from ai.prompts.plan_iteration_prompt import PLAN_ITERATION_SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ class GeminiProvider:
                 model=self.model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    system_instruction="You are Zimna, a supportive AI life coach."
+                    system_instruction="You are Yiyara, a supportive AI life coach."
                 )
             )
             return response.text
@@ -49,6 +50,21 @@ class GeminiProvider:
         except Exception as e:
             logger.error(f"Gemini Structured Error: {e}")
             raise e
+
+    def generate_plan_response(self, prompt):
+        try:
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_json_schema=PLAN_ITERATION_SCHEMA,
+                ),
+            )
+            return response.text
+        except Exception as e:
+            logger.error(f"Gemini Plan Iteration Error: {e}")
+            raise
         
     def classify_intent(self, user_input):
         """

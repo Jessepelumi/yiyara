@@ -1,6 +1,6 @@
 # Development Guide
 
-This guide provides information for developers contributing to the Zimna project.
+This guide provides information for developers contributing to the Yiyara project.
 
 ## Development Setup
 
@@ -175,4 +175,4 @@ See the [Deployment Guide](deployment.md) for production setup.
 - Create detailed bug reports
 - Ask questions in discussions
 - Review pull requests constructively</content>
-  <parameter name="filePath">/Users/jeolad/Documents/zimna/docs/guides/development.md
+  <parameter name="filePath">/Users/jeolad/Documents/yiyara/docs/guides/development.md
