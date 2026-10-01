@@ -35,7 +35,7 @@ class Task(models.Model):
 
     # ordering for tasks
     class Meta:
-        ordering = ['-created_at']
+        ordering = ['created_at']
 
     def __str__(self):
         return self.title

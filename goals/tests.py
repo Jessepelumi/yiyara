@@ -6,10 +6,10 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from conversations.models import Conversation, Message
-from goals.models import Goal
+from goals.models import Goal, Plan, PlanRevision
 from tasks.models import Task
 from ai.providers.gemini_provider import GeminiConfigurationError
-from workflow.ai_engine import GoalDecompositionError, ZimnaWorkflow
+from workflow.ai_engine import GoalDecompositionError, YiyaraWorkflow
 
 User = get_user_model()
 
@@ -51,12 +51,13 @@ class GoalWorkflowTests(TestCase):
         self.user = User.objects.create_user(email="owner@example.com")
 
     def test_valid_ai_output_is_saved_atomically(self):
-        workflow = ZimnaWorkflow(provider=StubProvider(VALID_DECOMPOSITION))
+        workflow = YiyaraWorkflow(provider=StubProvider(VALID_DECOMPOSITION))
 
-        goals = workflow.create_goals_from_ai(self.user, "Build my portfolio")
+        plan = workflow.create_plan_from_ai(self.user, "Build my portfolio")
 
-        self.assertEqual(len(goals), 1)
-        goal = Goal.objects.get(user=self.user)
+        self.assertEqual(plan.goals.count(), 1)
+        goal = plan.goals.get()
+        self.assertEqual(plan.raw_input, "Build my portfolio")
         self.assertEqual(goal.raw_input, "Build my portfolio")
         self.assertEqual(goal.tasks.count(), 2)
         self.assertEqual(
@@ -64,30 +65,33 @@ class GoalWorkflowTests(TestCase):
             "2026-09-15",
         )
         self.assertEqual(
-            Message.objects.get(conversation__goal=goal).role,
+            Message.objects.get(conversation__plan=plan).role,
             Message.Role.ASSISTANT,
         )
+        self.assertTrue(PlanRevision.objects.filter(plan=plan, version=1).exists())
 
     def test_invalid_ai_output_saves_nothing(self):
         invalid = [{**VALID_DECOMPOSITION[0], "tasks": []}]
-        workflow = ZimnaWorkflow(provider=StubProvider(invalid))
+        workflow = YiyaraWorkflow(provider=StubProvider(invalid))
 
         with self.assertRaises(GoalDecompositionError):
-            workflow.create_goals_from_ai(self.user, "Build my portfolio")
+            workflow.create_plan_from_ai(self.user, "Build my portfolio")
 
+        self.assertFalse(Plan.objects.exists())
         self.assertFalse(Goal.objects.exists())
         self.assertFalse(Task.objects.exists())
 
     def test_database_error_rolls_back_goal_and_tasks(self):
-        workflow = ZimnaWorkflow(provider=StubProvider(VALID_DECOMPOSITION))
+        workflow = YiyaraWorkflow(provider=StubProvider(VALID_DECOMPOSITION))
 
         with patch(
             "workflow.ai_engine.Task.objects.bulk_create",
             side_effect=RuntimeError("database write failed"),
         ):
             with self.assertRaises(RuntimeError):
-                workflow.create_goals_from_ai(self.user, "Build my portfolio")
+                workflow.create_plan_from_ai(self.user, "Build my portfolio")
 
+        self.assertFalse(Plan.objects.exists())
         self.assertFalse(Goal.objects.exists())
         self.assertFalse(Task.objects.exists())
 
@@ -111,10 +115,20 @@ class GoalApiTests(TestCase):
             )
 
         self.assertEqual(create_response.status_code, 201)
-        self.assertEqual(len(create_response.data), 1)
-        self.assertEqual(len(create_response.data[0]["tasks"]), 2)
+        self.assertEqual(len(create_response.data["goals"]), 1)
+        self.assertEqual(len(create_response.data["goals"][0]["tasks"]), 2)
+        self.assertIsNotNone(create_response.data["conversation_id"])
 
-        Goal.objects.create(user=self.other_user, title="Private goal")
+        private_plan = Plan.objects.create(
+            user=self.other_user,
+            title="Private plan",
+            raw_input="Private plan",
+        )
+        Goal.objects.create(
+            plan=private_plan,
+            user=self.other_user,
+            title="Private goal",
+        )
         list_response = self.client.get("/api/list/")
 
         self.assertEqual(list_response.status_code, 200)
@@ -136,13 +150,33 @@ class GoalApiTests(TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data[0]["title"], "Launch portfolio")
-        self.assertEqual(len(response.data[0]["tasks"]), 2)
-        self.assertNotIn("id", response.data[0])
+        self.assertEqual(response.data["title"], "Build my portfolio")
+        self.assertEqual(response.data["goals"][0]["title"], "Launch portfolio")
+        self.assertEqual(len(response.data["goals"][0]["tasks"]), 2)
+        self.assertNotIn("id", response.data["goals"][0])
+        self.assertFalse(Plan.objects.exists())
         self.assertFalse(Goal.objects.exists())
         self.assertFalse(Task.objects.exists())
         self.assertFalse(Conversation.objects.exists())
         self.assertFalse(Message.objects.exists())
+
+    def test_authenticated_user_can_import_guest_preview_as_one_board(self):
+        response = self.client.post(
+            "/api/plans/import-preview/",
+            {
+                "title": "Build my portfolio",
+                "raw_input": "Build my portfolio",
+                "goals": VALID_DECOMPOSITION,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(len(response.data["goals"]), 1)
+        plan = Plan.objects.get(user=self.user)
+        self.assertEqual(plan.goals.count(), 1)
+        self.assertTrue(Conversation.objects.filter(plan=plan).exists())
+        self.assertTrue(PlanRevision.objects.filter(plan=plan, version=1).exists())
 
     def test_invalid_ai_output_returns_error_and_does_not_persist(self):
         with patch(
@@ -183,6 +217,18 @@ class GoalApiTests(TestCase):
             format="json",
         )
         list_response = self.client.get("/api/list/")
+        plans_response = self.client.get("/api/plans/")
+        import_response = self.client.post(
+            "/api/plans/import-preview/",
+            {
+                "title": "Build my portfolio",
+                "raw_input": "Build my portfolio",
+                "goals": VALID_DECOMPOSITION,
+            },
+            format="json",
+        )
 
         self.assertEqual(create_response.status_code, 401)
         self.assertEqual(list_response.status_code, 401)
+        self.assertEqual(plans_response.status_code, 401)
+        self.assertEqual(import_response.status_code, 401)
