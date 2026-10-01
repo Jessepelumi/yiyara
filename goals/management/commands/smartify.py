@@ -1,7 +1,7 @@
 import os
 from django.core.management.base import BaseCommand
 from django.contrib.auth import get_user_model
-from workflow.ai_engine import ZimnaWorkflow
+from workflow.ai_engine import YiyaraWorkflow
 
 User = get_user_model()
 
@@ -20,9 +20,9 @@ class Command(BaseCommand):
 
         # Execution
         api_key = os.getenv("GEMINI_API_KEY")
-        engine = ZimnaWorkflow(api_key=api_key)
+        engine = YiyaraWorkflow(api_key=api_key)
         
-        self.stdout.write("Zimna is thinking...")
+        self.stdout.write("Yiyara is thinking...")
         results = engine.create_goals_from_ai(user, options['goal_text'])
 
         # Output

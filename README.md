@@ -1,8 +1,8 @@
-# Zimna Backend
+# Yiyara Backend
 
-Zimna is an AI-powered life planning and goal management platform designed to help users turn long-term goals into clear, actionable steps.
+Yiyara is an AI-powered life planning and goal management platform designed to help users turn long-term goals into clear, actionable steps.
 
-This repository contains the backend service for Zimna, built with Django and Django REST Framework. It provides REST APIs for authentication, goal management, task planning, scheduling, and AI-powered features.
+This repository contains the backend service for Yiyara, built with Django and Django REST Framework. It provides REST APIs for authentication, goal management, task planning, scheduling, and AI-powered features.
 
 For a detailed architectural overview of how the backend components connect and work together, see [backend.md](backend.md).
 
@@ -85,8 +85,8 @@ Message (conversations.Message)
 1. User submits raw text (e.g., "I want to get fit and lose weight")
 2. Frontend calls `POST /api/decompose/` with JWT auth
 3. `DecomposeGoalView` receives request
-4. Calls `ZimnaWorkflow.create_goals_from_ai(user, raw_text)`
-5. `ZimnaWorkflow` builds prompt using `DECOMPOSITION_SYSTEM_PROMPT`
+4. Calls `YiyaraWorkflow.create_goals_from_ai(user, raw_text)`
+5. `YiyaraWorkflow` builds prompt using `DECOMPOSITION_SYSTEM_PROMPT`
 6. Calls `GeminiProvider.generate_structured_response()` for JSON parsing
 7. Parses AI response into goal/task data structures
 8. Creates `Goal` and `Task` records in database transaction
@@ -102,17 +102,17 @@ Message (conversations.Message)
 1. User sends message with `goal_id` or `conversation_id`
 2. Frontend calls `POST /api/conversations/chat/`
 3. `ChatAPIView` ensures `Conversation` exists for goal/user
-4. Calls `handle_zimna_logic(user, conversation, raw_text)`
+4. Calls `handle_yiyara_logic(user, conversation, raw_text)`
 5. Saves user message to database
 6. Calls `GeminiProvider.classify_intent()` to determine: DECOMPOSE/QUERY/CHAT
-7. **If DECOMPOSE:** Calls `ZimnaWorkflow.create_goals_from_ai()` (same as above)
+7. **If DECOMPOSE:** Calls `YiyaraWorkflow.create_goals_from_ai()` (same as above)
 8. **If QUERY:** Returns placeholder (RAG logic pending)
 9. **If CHAT:** Builds conversation history, calls `GeminiProvider.generate_response()`
 10. Saves AI message and returns it
 
 ### AI Integration Details
 
-#### `workflow/ai_engine.py` - ZimnaWorkflow
+#### `workflow/ai_engine.py` - YiyaraWorkflow
 - Main AI orchestration class
 - `create_goals_from_ai()`: Core method for goal decomposition
 - Uses `GeminiProvider` for structured JSON responses
@@ -171,7 +171,7 @@ INTERNAL_AUTH_SECRET=your_internal_secret
 ```bash
 # Clone repository
 git clone <repository-url>
-cd zimna-backend
+cd yiyara-backend
 
 # Create virtual environment
 python -m venv venv
@@ -193,8 +193,8 @@ python manage.py runserver
 ### Docker
 ```bash
 # Build and run with Docker
-docker build -t zimna-backend .
-docker run -p 8000:8000 zimna-backend
+docker build -t yiyara-backend .
+docker run -p 8000:8000 yiyara-backend
 ```
 
 ### Testing AI Features
@@ -331,7 +331,7 @@ Follow the steps below to set up the backend locally.
 
 ```bash
 git clone <repository-url>
-cd zimna-backend
+cd yiyara-backend
 ```
 
 ### 2. Install Dependencies
@@ -351,7 +351,7 @@ ALLOWED_HOSTS=localhost,127.0.0.1
 
 # Database Configuration
 PGHOST=localhost
-PGDATABASE=zimna_db
+PGDATABASE=yiyara_db
 PGUSER=your_db_user
 PGPASSWORD=your_db_password
 PGPORT=5432
@@ -365,7 +365,7 @@ GEMINI_API_KEY=your-google-gemini-api-key
 Ensure PostgreSQL is running and create the database:
 
 ```bash
-createdb zimna_db
+createdb yiyara_db
 ```
 
 ### 5. Run Migrations
@@ -404,10 +404,10 @@ If you prefer using Docker:
 
 ```bash
 # Build the image
-docker build -t zimna-backend .
+docker build -t yiyara-backend .
 
 # Run the container
-docker run -p 8000:8000 --env-file .env zimna-backend
+docker run -p 8000:8000 --env-file .env yiyara-backend
 ```
 
 ---
@@ -488,4 +488,4 @@ This project is private and proprietary. All rights reserved.
 
 ## ✨ Author
 
-Built by Jesse Adesina as part of Zimna AI platform.
+Built by Jesse Adesina as part of Yiyara AI platform.
