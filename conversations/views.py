@@ -5,7 +5,7 @@ from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ai.providers.gemini_provider import GeminiConfigurationError
+from ai.providers.base import AIConfigurationError
 from goals.models import Plan, PlanChange
 from goals.serializers import PlanChangeSerializer, PlanSerializer
 from goals.services import (
@@ -68,6 +68,7 @@ class PlanMessagesView(APIView):
         )
 
         client_id = data.get("client_id")
+        existing = None
         if client_id:
             existing = conversation.messages.filter(
                 client_id=client_id,
@@ -76,18 +77,23 @@ class PlanMessagesView(APIView):
             if existing:
                 assistant = conversation.messages.filter(
                     role=Message.Role.ASSISTANT,
-                    created_at__gte=existing.created_at,
+                    metadata__request_client_id=str(client_id),
                 ).first()
-                return Response(
-                    {
-                        "conversation_id": conversation.id,
-                        "messages": MessageSerializer(
-                            [message for message in (existing, assistant) if message],
-                            many=True,
-                        ).data,
-                        "change": None,
-                    }
-                )
+                if existing.metadata.get("ai_status") != "failed" or assistant:
+                    return Response(
+                        {
+                            "conversation_id": conversation.id,
+                            "messages": MessageSerializer(
+                                [
+                                    message
+                                    for message in (existing, assistant)
+                                    if message
+                                ],
+                                many=True,
+                            ).data,
+                            "change": None,
+                        }
+                    )
 
         try:
             user_message, assistant_message, change = handle_plan_message(
@@ -96,6 +102,7 @@ class PlanMessagesView(APIView):
                 data["content"],
                 scope_goal=scope_goal,
                 client_id=client_id,
+                user_message=existing,
             )
             return Response(
                 {
@@ -107,7 +114,7 @@ class PlanMessagesView(APIView):
                 },
                 status=status.HTTP_201_CREATED,
             )
-        except GeminiConfigurationError as exc:
+        except AIConfigurationError as exc:
             return Response(
                 {"error": "ai_not_configured", "message": str(exc)},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
