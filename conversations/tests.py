@@ -1,4 +1,3 @@
-import json
 import uuid
 from unittest.mock import patch
 
@@ -6,6 +5,7 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
+from ai.providers.base import AIUnavailableError
 from conversations.models import Conversation, Message
 from goals.models import Goal, PlanChange, PlanRevision
 from tasks.models import Task
@@ -43,16 +43,21 @@ DECOMPOSITION = [
 ]
 
 
-class StubProvider:
-    def __init__(self, decomposition=None, plan_response=None):
+class StubGateway:
+    def __init__(self, decomposition=None, plan_response=None, error=None):
         self.decomposition = decomposition
         self.plan_response = plan_response
+        self.error = error
 
-    def generate_structured_response(self, prompt):
-        return json.dumps(self.decomposition)
-
-    def generate_plan_response(self, prompt):
-        return json.dumps(self.plan_response)
+    def generate_json(self, *, task, **kwargs):
+        if self.error:
+            raise self.error
+        if str(task) == "goal_decomposition":
+            payload = self.decomposition
+        else:
+            payload = self.plan_response
+        validator = kwargs.get("validator")
+        return validator(payload) if validator else payload
 
 
 class PlanConversationApiTests(TestCase):
@@ -60,7 +65,7 @@ class PlanConversationApiTests(TestCase):
         self.user = User.objects.create_user(email="owner@example.com")
         self.other_user = User.objects.create_user(email="other@example.com")
         self.plan = YiyaraWorkflow(
-            provider=StubProvider(decomposition=DECOMPOSITION)
+            gateway=StubGateway(decomposition=DECOMPOSITION)
         ).create_plan_from_ai(self.user, "Build a freelance business")
         self.goal = self.plan.goals.order_by("created_at").first()
         self.task = self.goal.tasks.first()
@@ -74,8 +79,8 @@ class PlanConversationApiTests(TestCase):
             "changes": [],
         }
         with patch(
-            "conversations.services.GeminiProvider",
-            return_value=StubProvider(plan_response=response_payload),
+            "conversations.services.get_ai_gateway",
+            return_value=StubGateway(plan_response=response_payload),
         ):
             response = self.client.post(
                 f"/api/conversations/plans/{self.plan.id}/messages/",
@@ -106,8 +111,8 @@ class PlanConversationApiTests(TestCase):
             ],
         }
         with patch(
-            "conversations.services.GeminiProvider",
-            return_value=StubProvider(plan_response=response_payload),
+            "conversations.services.get_ai_gateway",
+            return_value=StubGateway(plan_response=response_payload),
         ):
             propose_response = self.client.post(
                 f"/api/conversations/plans/{self.plan.id}/messages/",
@@ -201,3 +206,58 @@ class PlanConversationApiTests(TestCase):
             f"/api/conversations/plans/{self.plan.id}/messages/"
         )
         self.assertEqual(response.status_code, 404)
+
+    def test_failed_idempotent_message_can_be_retried(self):
+        client_id = uuid.uuid4()
+        url = f"/api/conversations/plans/{self.plan.id}/messages/"
+        request_data = {
+            "content": "Help me connect these goals",
+            "plan_version": self.plan.version,
+            "client_id": str(client_id),
+        }
+
+        with patch(
+            "conversations.services.get_ai_gateway",
+            return_value=StubGateway(
+                error=AIUnavailableError("all providers unavailable")
+            ),
+        ):
+            failed_response = self.client.post(url, request_data, format="json")
+
+        self.assertEqual(failed_response.status_code, 502)
+        user_message = Message.objects.get(
+            conversation__plan=self.plan,
+            role=Message.Role.USER,
+            client_id=client_id,
+        )
+        self.assertEqual(user_message.metadata["ai_status"], "failed")
+
+        successful_payload = {
+            "reply": "The portfolio supports your client outreach.",
+            "summary": "No board changes",
+            "changes": [],
+        }
+        with patch(
+            "conversations.services.get_ai_gateway",
+            return_value=StubGateway(plan_response=successful_payload),
+        ):
+            retry_response = self.client.post(url, request_data, format="json")
+
+        self.assertEqual(retry_response.status_code, 201)
+        self.assertEqual(
+            Message.objects.filter(
+                conversation__plan=self.plan,
+                role=Message.Role.USER,
+                client_id=client_id,
+            ).count(),
+            1,
+        )
+        user_message.refresh_from_db()
+        self.assertEqual(user_message.metadata["ai_status"], "completed")
+        self.assertTrue(
+            Message.objects.filter(
+                conversation__plan=self.plan,
+                role=Message.Role.ASSISTANT,
+                metadata__request_client_id=str(client_id),
+            ).exists()
+        )
