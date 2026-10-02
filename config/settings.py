@@ -18,6 +18,13 @@ from datetime import timedelta
 # Load environment variables
 load_dotenv()
 
+
+def env_list(name, default):
+    value = os.getenv(name)
+    if not value:
+        return tuple(default)
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -165,6 +172,94 @@ SIMPLE_JWT = {
     'ALGORITHM': 'HS256',
     'SIGNING_KEY': SECRET_KEY,
     'AUTH_HEADER_TYPES': ('Bearer',),
+}
+
+
+# AI provider routing
+AI_REQUEST_TIMEOUT_SECONDS = float(os.getenv("AI_REQUEST_TIMEOUT_SECONDS", "30"))
+AI_TOTAL_TIMEOUT_SECONDS = float(os.getenv("AI_TOTAL_TIMEOUT_SECONDS", "45"))
+AI_RETRY_MAX_ATTEMPTS = int(os.getenv("AI_RETRY_MAX_ATTEMPTS", "2"))
+AI_RETRY_MIN_SECONDS = float(os.getenv("AI_RETRY_MIN_SECONDS", "0.5"))
+AI_RETRY_MAX_SECONDS = float(os.getenv("AI_RETRY_MAX_SECONDS", "4"))
+AI_MAX_OUTPUT_TOKENS = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "4096"))
+
+AI_PROVIDER_ORDER = env_list("AI_PROVIDER_ORDER", ("gemini",))
+AI_ROUTES = {
+    "goal_decomposition": env_list(
+        "AI_DECOMPOSITION_PROVIDERS",
+        AI_PROVIDER_ORDER,
+    ),
+    "plan_iteration": env_list(
+        "AI_PLAN_ITERATION_PROVIDERS",
+        AI_PROVIDER_ORDER,
+    ),
+}
+
+_openrouter_headers = {
+    key: value
+    for key, value in {
+        "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL"),
+        "X-Title": os.getenv("OPENROUTER_APP_NAME", "Yiyara"),
+    }.items()
+    if value
+}
+
+AI_PROVIDERS = {
+    "gemini": {
+        "BACKEND": "ai.providers.gemini_provider.GeminiProvider",
+        "OPTIONS": {
+            "api_key": os.getenv("GEMINI_API_KEY"),
+            "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
+            "timeout_seconds": AI_REQUEST_TIMEOUT_SECONDS,
+        },
+    },
+    "groq": {
+        "BACKEND": (
+            "ai.providers.openai_compatible_provider.OpenAICompatibleProvider"
+        ),
+        "OPTIONS": {
+            "name": "groq",
+            "api_key": os.getenv("GROQ_API_KEY"),
+            "base_url": os.getenv(
+                "GROQ_BASE_URL",
+                "https://api.groq.com/openai/v1",
+            ),
+            "model": os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
+            "structured_mode": "json_schema",
+        },
+    },
+    "openrouter": {
+        "BACKEND": (
+            "ai.providers.openai_compatible_provider.OpenAICompatibleProvider"
+        ),
+        "OPTIONS": {
+            "name": "openrouter",
+            "api_key": os.getenv("OPENROUTER_API_KEY"),
+            "base_url": os.getenv(
+                "OPENROUTER_BASE_URL",
+                "https://openrouter.ai/api/v1",
+            ),
+            "model": os.getenv("OPENROUTER_MODEL", "openrouter/free"),
+            "structured_mode": "json_schema",
+            "extra_headers": _openrouter_headers,
+            "extra_body": {"provider": {"require_parameters": True}},
+        },
+    },
+    "ollama": {
+        "BACKEND": (
+            "ai.providers.openai_compatible_provider.OpenAICompatibleProvider"
+        ),
+        "OPTIONS": {
+            "name": "ollama",
+            "api_key": os.getenv("OLLAMA_API_KEY", "ollama"),
+            "base_url": os.getenv(
+                "OLLAMA_BASE_URL",
+                "http://localhost:11434/v1",
+            ),
+            "model": os.getenv("OLLAMA_MODEL", "qwen3:8b"),
+            "structured_mode": "json_schema",
+        },
+    },
 }
 
 
