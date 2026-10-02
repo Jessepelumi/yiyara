@@ -50,7 +50,7 @@ class PreviewDecomposeGoalView(APIView):
             }
             response_serializer = PreviewPlanSerializer(preview)
             return Response(response_serializer.data, status=status.HTTP_200_OK)
-        except ai_engine.GeminiConfigurationError as exc:
+        except ai_engine.AIConfigurationError as exc:
             return Response(
                 {"error": "ai_not_configured", "message": str(exc)},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -86,7 +86,7 @@ class DecomposeGoalView(APIView):
             serializer = PlanSerializer(plan)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-        except ai_engine.GeminiConfigurationError as exc:
+        except ai_engine.AIConfigurationError as exc:
             return Response(
                 {"error": "ai_not_configured", "message": str(exc)},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,

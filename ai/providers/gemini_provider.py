@@ -1,104 +1,143 @@
-from google import genai
-from google.genai import types
+from __future__ import annotations
+
 import os
-import logging
+import time
+from contextlib import suppress
 
-from ai.prompts.goal_decomposition_prompt import GOAL_DECOMPOSITION_SCHEMA
-from ai.prompts.plan_iteration_prompt import PLAN_ITERATION_SCHEMA
+import httpx
+from google import genai
+from google.genai import errors, types
 
-logger = logging.getLogger(__name__)
+from .base import (
+    AIConfigurationError,
+    AIInvalidResponseError,
+    AIProviderError,
+    AIRateLimitError,
+    AIRetryableProviderError,
+    AITimeoutError,
+    GenerationRequest,
+    GenerationResult,
+)
 
 
-class GeminiConfigurationError(RuntimeError):
-    pass
+# Retained as an import-compatible alias for older callers.
+GeminiConfigurationError = AIConfigurationError
 
 
 class GeminiProvider:
-    def __init__(self, api_key=None):
+    """Google Gemini adapter implementing Yiyara's neutral provider contract."""
+
+    name = "gemini"
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str | None = None,
+        timeout_seconds: float = 30.0,
+    ):
         api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not api_key:
-            raise GeminiConfigurationError("GEMINI_API_KEY is not configured")
+            raise AIConfigurationError("GEMINI_API_KEY is not configured")
 
-        self.client = genai.Client(api_key=api_key)
-        self.model_name = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        self.api_key = api_key
+        self.timeout_seconds = timeout_seconds
+        self.client = self._create_client(timeout_seconds)
 
-    def generate_response(self, prompt, history=None):
-        try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction="You are Yiyara, a supportive AI life coach."
-                )
+    def _create_client(self, timeout_seconds: float):
+        return genai.Client(
+            api_key=self.api_key,
+            http_options=types.HttpOptions(
+                timeout=max(1, round(timeout_seconds * 1000)),
+                # Keep retry policy in AIGateway so fallbacks have one bounded budget.
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        )
+
+    def generate(self, request: GenerationRequest) -> GenerationResult:
+        config_args = {
+            "temperature": request.temperature,
+            "max_output_tokens": request.max_output_tokens,
+        }
+        if request.system_prompt:
+            config_args["system_instruction"] = request.system_prompt
+        if request.response_schema:
+            config_args.update(
+                response_mime_type="application/json",
+                response_json_schema=request.response_schema,
             )
-            return response.text
-        except Exception as e:
-            logger.error(f"Gemini API Error: {e}")
-            return "I'm having trouble thinking right now."
 
-    def generate_structured_response(self, prompt):
+        client = self.client
+        close_client = False
+        if request.timeout_seconds < self.timeout_seconds:
+            # A fallback may start near the shared gateway deadline. Use a
+            # shorter-lived client so this SDK call cannot overrun that budget.
+            client = self._create_client(request.timeout_seconds)
+            close_client = True
+
+        started_at = time.monotonic()
         try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_json_schema=GOAL_DECOMPOSITION_SCHEMA,
-                )
+            response = client.models.generate_content(
+                model=self.model,
+                contents=request.prompt,
+                config=types.GenerateContentConfig(**config_args),
             )
-            return response.text
-        except Exception as e:
-            logger.error(f"Gemini Structured Error: {e}")
-            raise e
+        except errors.APIError as exc:
+            self._raise_api_error(exc)
+        except httpx.TimeoutException as exc:
+            raise AITimeoutError("gemini", "Gemini request timed out") from exc
+        except httpx.TransportError as exc:
+            raise AIRetryableProviderError(
+                "gemini",
+                "Gemini transport failed",
+            ) from exc
+        finally:
+            if close_client:
+                with suppress(Exception):
+                    client.close()
 
-    def generate_plan_response(self, prompt):
-        try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_json_schema=PLAN_ITERATION_SCHEMA,
+        content = response.text
+        if not isinstance(content, str) or not content.strip():
+            raise AIInvalidResponseError(
+                "gemini",
+                "Gemini returned an empty response",
+            )
+
+        usage_metadata = getattr(response, "usage_metadata", None)
+        usage = {}
+        if usage_metadata:
+            usage = {
+                "input_tokens": getattr(usage_metadata, "prompt_token_count", None),
+                "output_tokens": getattr(
+                    usage_metadata,
+                    "candidates_token_count",
+                    None,
                 ),
-            )
-            return response.text
-        except Exception as e:
-            logger.error(f"Gemini Plan Iteration Error: {e}")
-            raise
-        
-    def classify_intent(self, user_input):
-        """
-        Determines if the user wants to create a goal, ask a question, or just chat.
-        """
-        prompt = f"""
-        Analyze the following user input and classify it into ONE of these categories:
-        - DECOMPOSE: User wants to start a new goal, project, or task list.
-        - QUERY: User is asking for information about their existing goals or progress.
-        - CHAT: General conversation, greetings, or follow-up questions.
+                "total_tokens": getattr(usage_metadata, "total_token_count", None),
+            }
+            usage = {key: value for key, value in usage.items() if value is not None}
 
-        Input: "{user_input}"
-        
-        Return ONLY the word: DECOMPOSE, QUERY, or CHAT.
-        """
-        try:
-            # Use self.client.models.generate_content (New SDK style)
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1, # Low temperature for strict classification
-                )
-            )
-            
-            intent = response.text.strip().upper()
-            
-            # Clean up the response in case it returned "Category: DECOMPOSE" or similar
-            for valid_intent in ['DECOMPOSE', 'QUERY', 'CHAT']:
-                if valid_intent in intent:
-                    return valid_intent
-                    
-            return 'CHAT' # Final fallback
-            
-        except Exception as e:
-            logger.error(f"Classification Error: {e}")
-            return 'CHAT' # Fallback to chat so the user isn't stuck
+        return GenerationResult(
+            content=content.strip(),
+            provider=self.name,
+            model=self.model,
+            latency_ms=round((time.monotonic() - started_at) * 1000),
+            usage=usage,
+        )
+
+    @staticmethod
+    def _raise_api_error(exc: errors.APIError) -> None:
+        code = getattr(exc, "code", None)
+        if code == 429:
+            raise AIRateLimitError("gemini", "Gemini rate limit exceeded") from exc
+        if code in {408, 409, 425} or (
+            isinstance(code, int) and code >= 500
+        ):
+            raise AIRetryableProviderError(
+                "gemini",
+                f"Gemini temporarily unavailable ({code})",
+            ) from exc
+        raise AIProviderError(
+            "gemini",
+            f"Gemini rejected the request ({code or 'unknown'})",
+        ) from exc

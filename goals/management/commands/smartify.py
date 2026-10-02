@@ -1,4 +1,3 @@
-import os
 from django.core.management.base import BaseCommand
 from django.contrib.auth import get_user_model
 from workflow.ai_engine import YiyaraWorkflow
@@ -19,9 +18,8 @@ class Command(BaseCommand):
             return
 
         # Execution
-        api_key = os.getenv("GEMINI_API_KEY")
-        engine = YiyaraWorkflow(api_key=api_key)
-        
+        engine = YiyaraWorkflow()
+
         self.stdout.write("Yiyara is thinking...")
         results = engine.create_goals_from_ai(user, options['goal_text'])
 
@@ -33,5 +31,3 @@ class Command(BaseCommand):
                 # Accessing related tasks from the 'tasks' app
                 for task in goal.tasks.all():
                     self.stdout.write(f"   └─ [Task] {task.title}")
-
-                    
