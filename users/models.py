@@ -1,10 +1,10 @@
 import uuid
+
 from django.db import models
 from django.contrib.auth.models import AbstractUser, BaseUserManager
 
-# custom user manager to create admin superuser
-class UserManager(BaseUserManager):
 
+class UserManager(BaseUserManager):
     def create_user(self, email, password=None, **extra_fields):
         if not email:
             raise ValueError("Email is required")
@@ -35,28 +35,34 @@ class UserManager(BaseUserManager):
     def get_by_natural_key(self, username):
         return self.get(email=username)
 
-# user class
-class User(AbstractUser):
 
-    # override the default auto-incrementing integer 
+class User(AbstractUser): 
     id = models.UUIDField(
         primary_key=True, 
         default=uuid.uuid4, 
         editable=False
     )
 
-    # optional username
     username = models.CharField(
         max_length=150,
         blank=True,
         unique=True
     )
 
-    # email
-    email = models.EmailField(unique=True, db_index=True)
+    email = models.EmailField(
+        unique=True, 
+        db_index=True
+    )
     is_email_verified = models.BooleanField(default=False)
 
-    # firstname & lastname
+    google_sub = models.CharField(
+        max_length=255,
+        unique=True,
+        null=True,
+        blank=True,
+        editable=False,
+    )
+
     first_name = models.CharField(max_length=150, blank=True)
     last_name = models.CharField(max_length=150, blank=True)
 
@@ -74,25 +80,23 @@ class User(AbstractUser):
     USERNAME_FIELD = "email"
     REQUIRED_FIELDS = []
 
-    # attach custom user manager to user
     objects = UserManager()
 
     class Meta:
         ordering = ['email']
 
     def save(self, *args, **kwargs):
-
-        # auto-generate username from email if empty
         if self.email:
             self.email = self.email.lower()
 
         if not self.username and self.email:
-
             base = self.email.split("@")[0]
             username = base
             counter = 1
 
-            while User.objects.filter(username=username).exclude(pk=self.pk).exists():
+            while User.objects.filter(
+                username=username
+            ).exclude(pk=self.pk).exists():
                 username = f"{base}{counter}"
                 counter += 1
 
