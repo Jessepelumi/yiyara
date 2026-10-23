@@ -1,54 +1,307 @@
+
+from unittest.mock import patch
+
 from django.contrib.auth import get_user_model
-from django.test import TestCase, override_settings
-from rest_framework.test import APIClient
+from django.core.cache import cache
+from django.test import override_settings
+
+from rest_framework import status
+from rest_framework.test import APITestCase
 
 User = get_user_model()
 
 
-class InternalAuthViewTests(TestCase):
+@override_settings(
+    GOOGLE_CLIENT_IDS=(
+        "test-client.apps.googleusercontent.com",
+    )
+)
+class AuthenticationTests(APITestCase):
+
+    google_url = "/api/users/auth/google/"
+    refresh_url = "/api/users/auth/refresh/"
+    logout_url = "/api/users/auth/logout/"
+    me_url = "/api/users/me/"
+
     def setUp(self):
-        self.client = APIClient()
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.claims = {
+            "sub": "google-user-123",
+            "email": "test@gmail.com",
+            "email_verified": True,
+            "aud": "test-client.apps.googleusercontent.com",
+            "given_name": "Test",
+            "family_name": "User",
+        }
 
-    @override_settings(INTERNAL_AUTH_SECRET=None)
-    def test_bridge_is_closed_when_secret_is_not_configured(self):
+    def google_login(self, claims=None):
+        if claims is None:
+            claims = self.claims
+
+        with patch(
+            "users.views.google_id_token.verify_oauth2_token",
+            return_value=claims,
+        ):
+            return self.client.post(
+                self.google_url,
+                {"id_token": "mock-google-token"},
+                format="json",
+            )
+
+    def authenticate(self, access):
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+    def test_new_google_user_is_created(self):
+        response = self.google_login()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("access", response.data)
+        self.assertIn("refresh", response.data)
+
+        user = User.objects.get(email="test@gmail.com")
+
+        self.assertEqual(
+            user.google_sub,
+            "google-user-123",
+        )
+        self.assertTrue(user.is_email_verified)
+        self.assertFalse(user.has_usable_password())
+
+    def test_returning_google_user(self):
+        self.google_login()
+        response = self.google_login()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(User.objects.count(), 1)
+
+    def test_missing_token(self):
         response = self.client.post(
-            "/api/users/auth/bridge/",
-            {"email": "owner@example.com"},
+            self.google_url,
+            {},
             format="json",
         )
 
-        self.assertEqual(response.status_code, 503)
-        self.assertFalse(User.objects.exists())
+        self.assertEqual(response.status_code, 400)
 
-    @override_settings(INTERNAL_AUTH_SECRET="expected-secret")
-    def test_bridge_rejects_missing_or_wrong_secret(self):
-        missing = self.client.post(
-            "/api/users/auth/bridge/",
-            {"email": "owner@example.com"},
-            format="json",
+    def test_invalid_google_token(self):
+        with patch(
+            "users.views.google_id_token.verify_oauth2_token",
+            side_effect=ValueError("Invalid token"),
+        ):
+            response = self.client.post(
+                self.google_url,
+                {"id_token": "invalid"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_expired_google_token(self):
+        with patch(
+            "users.views.google_id_token.verify_oauth2_token",
+            side_effect=ValueError("Token expired"),
+        ):
+            response = self.client.post(
+                self.google_url,
+                {"id_token": "expired"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_wrong_audience(self):
+        claims = {
+            **self.claims,
+            "aud": "untrusted-client",
+        }
+
+        response = self.google_login(claims)
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(User.objects.count(), 0)
+
+    def test_unverified_email(self):
+        claims = {
+            **self.claims,
+            "email_verified": False,
+        }
+
+        response = self.google_login(claims)
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_missing_google_subject(self):
+        claims = {
+            **self.claims,
+            "sub": "",
+        }
+
+        response = self.google_login(claims)
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_inactive_user_cannot_login(self):
+        User.objects.create_user(
+            email="test@gmail.com",
+            google_sub="google-user-123",
+            is_active=False,
         )
-        wrong = self.client.post(
-            "/api/users/auth/bridge/",
-            {"email": "owner@example.com"},
-            format="json",
-            HTTP_X_INTERNAL_SECRET="wrong-secret",
+
+        response = self.google_login()
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_existing_email_requires_linking(self):
+        User.objects.create_user(
+            email="test@gmail.com"
         )
 
-        self.assertEqual(missing.status_code, 401)
-        self.assertEqual(wrong.status_code, 401)
-        self.assertFalse(User.objects.exists())
+        response = self.google_login()
 
-    @override_settings(INTERNAL_AUTH_SECRET="expected-secret")
-    def test_bridge_creates_verified_user_and_returns_jwt(self):
+        self.assertEqual(response.status_code, 409)
+
+    def test_google_identity_email_conflict(self):
+        User.objects.create_user(
+            email="different@gmail.com",
+            google_sub="google-user-123",
+        )
+
+        response = self.google_login()
+
+        self.assertEqual(response.status_code, 409)
+
+    def test_me_requires_authentication(self):
+        response = self.client.get(self.me_url)
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_me_returns_current_user(self):
+        login = self.google_login()
+
+        self.authenticate(login.data["access"])
+
+        response = self.client.get(self.me_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["email"],
+            "test@gmail.com",
+        )
+        self.assertNotIn("google_sub", response.data)
+
+    def test_refresh_rotation(self):
+        login = self.google_login()
+        original_refresh = login.data["refresh"]
+
         response = self.client.post(
-            "/api/users/auth/bridge/",
-            {"email": "Owner@Example.com", "first_name": "Owner"},
+            self.refresh_url,
+            {"refresh": original_refresh},
             format="json",
-            HTTP_X_INTERNAL_SECRET="expected-secret",
         )
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("access", response.data)
         self.assertIn("refresh", response.data)
-        user = User.objects.get(email="owner@example.com")
-        self.assertTrue(user.is_email_verified)
+        self.assertNotEqual(
+            original_refresh,
+            response.data["refresh"],
+        )
+
+        replay = self.client.post(
+            self.refresh_url,
+            {"refresh": original_refresh},
+            format="json",
+        )
+
+        self.assertEqual(replay.status_code, 401)
+
+    def test_inactive_user_cannot_refresh(self):
+        login = self.google_login()
+
+        user = User.objects.get(email="test@gmail.com")
+        user.is_active = False
+        user.save(update_fields=["is_active"])
+
+        response = self.client.post(
+            self.refresh_url,
+            {"refresh": login.data["refresh"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_logout_revokes_refresh(self):
+        login = self.google_login()
+
+        self.authenticate(login.data["access"])
+
+        logout = self.client.post(
+            self.logout_url,
+            {"refresh": login.data["refresh"]},
+            format="json",
+        )
+
+        self.assertEqual(logout.status_code, 204)
+
+        refresh = self.client.post(
+            self.refresh_url,
+            {"refresh": login.data["refresh"]},
+            format="json",
+        )
+
+        self.assertEqual(refresh.status_code, 401)
+
+    def test_logout_requires_authentication(self):
+        login = self.google_login()
+
+        response = self.client.post(
+            self.logout_url,
+            {"refresh": login.data["refresh"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_cannot_logout_another_users_token(self):
+        first_login = self.google_login()
+
+        second_claims = {
+            **self.claims,
+            "sub": "google-user-456",
+            "email": "second@gmail.com",
+        }
+
+        second_login = self.google_login(second_claims)
+
+        self.authenticate(first_login.data["access"])
+
+        response = self.client.post(
+            self.logout_url,
+            {"refresh": second_login.data["refresh"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+        # Second user's refresh token must still work.
+        refresh = self.client.post(
+            self.refresh_url,
+            {"refresh": second_login.data["refresh"]},
+            format="json",
+        )
+
+        self.assertEqual(refresh.status_code, 200)
+
+    def test_old_auth_bridge_is_removed(self):
+        response = self.client.post(
+            "/api/users/auth/bridge/",
+            {
+                "email": "test@gmail.com",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 404)
