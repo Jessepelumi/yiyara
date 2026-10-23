@@ -15,6 +15,7 @@ class GoogleAuthSerializer(serializers.Serializer):
         write_only=True,
     )
 
+
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
@@ -27,6 +28,7 @@ class UserSerializer(serializers.ModelSerializer):
             "is_email_verified",
         ]
         read_only_fields = fields
+
 
 class LogoutSerializer(serializers.Serializer):
     refresh = serializers.CharField(
@@ -57,6 +59,7 @@ class LogoutSerializer(serializers.Serializer):
         self.context["refresh_token"] = token
 
         return value
+
 
 class ActiveUserTokenRefreshSerializer(TokenRefreshSerializer):
     def validate(self, attrs):
