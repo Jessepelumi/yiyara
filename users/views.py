@@ -134,6 +134,9 @@ class GoogleAuthView(APIView):
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "auth_google"
 
+    def get_authenticate_header(self, request):
+        return 'Bearer realm="api"'
+
     def post(self, request):
         serializer = GoogleAuthSerializer(
             data=request.data
@@ -183,6 +186,9 @@ class RefreshView(TokenRefreshView):
     authentication_classes = []
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "auth_refresh"
+
+    def get_authenticate_header(self, request):
+        return 'Bearer realm="api"'
 
 
 class LogoutView(APIView):
