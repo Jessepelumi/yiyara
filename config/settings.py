@@ -37,6 +37,12 @@ ALLOWED_HOSTS = env_list(
 # Google authentication
 GOOGLE_CLIENT_IDS = env_list("GOOGLE_CLIENT_IDS", ())
 
+# Google Calendar authorization is separate from sign-in.
+GOOGLE_CALENDAR_CLIENT_ID = os.getenv("GOOGLE_CALENDAR_CLIENT_ID", "")
+GOOGLE_CALENDAR_CLIENT_SECRET = os.getenv("GOOGLE_CALENDAR_CLIENT_SECRET", "")
+GOOGLE_CALENDAR_REDIRECT_URI = os.getenv("GOOGLE_CALENDAR_REDIRECT_URI", "")
+GOOGLE_CALENDAR_ENCRYPTION_KEY = os.getenv("GOOGLE_CALENDAR_ENCRYPTION_KEY", "")
+
 
 # Applications
 INSTALLED_APPS = [
@@ -57,6 +63,7 @@ INSTALLED_APPS = [
     "goals",
     "tasks",
     "conversations",
+    "calendars",
 ]
 
 
@@ -174,6 +181,7 @@ REST_FRAMEWORK = {
         "auth_google": "10/min",
         "auth_refresh": "20/min",
         "auth_logout": "20/min",
+        "calendar": "30/min",
     },
 }
 
@@ -257,3 +265,16 @@ USE_TZ = True
 
 # Static files
 STATIC_URL = "static/"
+
+# OAuth callback query strings contain temporary credentials.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "filters": {
+        "calendar_callback": {"()": "calendars.logging.RedactCalendarCallback"},
+    },
+    "loggers": {
+        "django.server": {"filters": ["calendar_callback"]},
+        "django.request": {"filters": ["calendar_callback"]},
+    },
+}
