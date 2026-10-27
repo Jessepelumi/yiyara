@@ -1,3 +1,5 @@
+import uuid
+
 from django.conf import settings
 from django.db import models
 
@@ -56,4 +58,36 @@ class ProtectedPeriod(models.Model):
                 ),
                 name="protected_period_valid_kind_and_range",
             ),
+        ]
+
+
+class WorkSession(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    task = models.ForeignKey("tasks.Task", null=True, on_delete=models.SET_NULL, related_name="sessions")
+    status = models.CharField(max_length=12, default="proposed", choices=[
+        ("proposed", "Proposed"), ("publishing", "Publishing"),
+        ("published", "Published"), ("rejected", "Rejected"),
+    ])
+    starts_at = models.DateTimeField()
+    ends_at = models.DateTimeField()
+    expires_at = models.DateTimeField()
+    destination_calendar = models.CharField(max_length=1024)
+    google_sub = models.CharField(max_length=255)
+    google_event_id = models.CharField(max_length=64, unique=True)
+    task_snapshot = models.JSONField(default=dict)
+    event_payload = models.JSONField(default=dict)
+    last_error = models.CharField(max_length=200, blank=True)
+    approved_at = models.DateTimeField(null=True)
+    published_at = models.DateTimeField(null=True)
+    publish_attempt = models.UUIDField(null=True)
+    lease_until = models.DateTimeField(null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(ends_at__gt=models.F("starts_at")), name="session_positive_duration"),
+            models.UniqueConstraint(fields=["task"], condition=models.Q(status__in=["publishing", "published"]),
+                                    name="one_committed_session_per_task"),
         ]
