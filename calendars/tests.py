@@ -406,3 +406,308 @@ class SchedulingRulesTests(APITestCase):
         with patch("calendars.services.api") as google:
             self.assertEqual(self.preview().status_code, 200)
             google.assert_not_called()
+
+
+class TaskSessionTests(APITestCase):
+    def setUp(self):
+        from goals.models import Goal, Plan
+        from tasks.models import Task
+        from .models import SchedulingPreferences
+
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.user = get_user_model().objects.create_user(email='sessions@gmail.com', google_sub='subject')
+        self.client.force_authenticate(self.user)
+        self.plan = Plan.objects.create(user=self.user, title='Study', raw_input='Study')
+        self.goal = Goal.objects.create(user=self.user, plan=self.plan, title='Learn arrays')
+        self.task = Task.objects.create(goal=self.goal, title='Solve two array exercises',
+                                        estimated_minutes=60, completion_criteria='Two solutions reviewed', readiness='ready')
+        self.start = (timezone.now() + timedelta(days=10)).replace(hour=9, minute=0, second=0, microsecond=0)
+        self.end = self.start + timedelta(hours=8)
+        SchedulingPreferences.objects.create(user=self.user, timezone='UTC', working_hours=[
+            {'weekday': day, 'start_time': '09:00', 'end_time': '17:00'} for day in range(7)
+        ])
+        CalendarConnection.objects.create(
+            user=self.user, google_sub='subject', email=self.user.email, credentials='not-used',
+            expires_at=timezone.now() + timedelta(hours=1), source_calendars=['source'], destination_calendar='target',
+        )
+        self.mock_api = patch('calendars.services.api', side_effect=self.freebusy).start()
+        self.addCleanup(patch.stopall)
+        patch('calendars.services.list_calendars', return_value=[{'id': 'target', 'accessRole': 'owner'}]).start()
+
+    def freebusy(self, user, method, path, **kwargs):
+        return {'calendars': {item['id']: {'busy': []} for item in kwargs['json']['items']}}
+
+    def propose(self, task=None):
+        task = task or self.task
+        return self.client.post(f'/api/tasks/{task.pk}/sessions/propose/', {
+            'time_min': self.start.isoformat(), 'time_max': self.end.isoformat(),
+        }, format='json')
+
+    def session(self):
+        from .models import WorkSession
+
+        response = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        return WorkSession.objects.get(pk=response.data['id'])
+
+    def approve(self, session):
+        return self.client.post(f'/api/sessions/{session.pk}/approve/')
+
+    def test_manual_task_create_update_and_revision(self):
+        from goals.services import restore_plan_revision
+
+        response = self.client.post('/api/tasks/', {
+            'goal_id': str(self.goal.pk), 'title': 'Manual task', 'estimated_minutes': 30,
+            'completion_criteria': 'Written notes', 'readiness': 'ready',
+        }, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        self.plan.refresh_from_db()
+        original = self.plan.revisions.get(version=self.plan.version)
+        task_id = response.data['id']
+        response = self.client.patch(f'/api/tasks/{task_id}/', {'estimated_minutes': 45}, format='json')
+        self.assertEqual(response.status_code, 200)
+        restore_plan_revision(original, self.user)
+        self.assertEqual(self.client.get(f'/api/tasks/{task_id}/').data['estimated_minutes'], 30)
+
+    def test_task_validation_and_unready_tasks(self):
+        from tasks.models import Task
+
+        for body in ({'readiness': 'ready', 'completion_criteria': ''}, {'estimated_minutes': 0}, {'estimated_minutes': 481}):
+            self.assertEqual(self.client.patch(f'/api/tasks/{self.task.pk}/', body, format='json').status_code, 400)
+        task = Task.objects.create(goal=self.goal, title='Legacy task')
+        self.assertEqual(self.propose(task).status_code, 400)
+        self.assertEqual(self.client.post('/api/tasks/', {'goal_id': 'invalid', 'title': 'Task'}, format='json').status_code, 400)
+
+    def test_proposal_has_no_external_writes(self):
+        with patch('calendars.sessions.event_request') as event:
+            session = self.session()
+            self.assertEqual(session.status, 'proposed')
+            self.assertEqual(session.starts_at, self.start)
+            self.assertEqual(session.ends_at - session.starts_at, timedelta(hours=1))
+            self.assertEqual(session.event_payload['visibility'], 'private')
+            event.assert_not_called()
+
+    def test_proposal_respects_google_grey_and_other_sessions(self):
+        from .models import ProtectedPeriod
+        from tasks.models import Task
+
+        ProtectedPeriod.objects.create(user=self.user, kind='one_off', starts_at=self.start, ends_at=self.start + timedelta(hours=1))
+        def busy(user, method, path, **kwargs):
+            return {'calendars': {i['id']: {'busy': [{'start': (self.start + timedelta(hours=1)).isoformat(),
+                     'end': (self.start + timedelta(hours=2)).isoformat()}]} for i in kwargs['json']['items']}}
+        self.mock_api.side_effect = busy
+        first = self.session()
+        self.assertEqual(first.starts_at, self.start + timedelta(hours=2))
+        second_task = Task.objects.create(goal=self.goal, title='Other work', estimated_minutes=60,
+                                          completion_criteria='Done', readiness='ready')
+        response = self.propose(second_task)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['starts_at'], (self.start + timedelta(hours=3)).isoformat().replace('+00:00', 'Z'))
+
+    def test_no_slot_and_missing_availability_do_not_make_proposals(self):
+        from .models import WorkSession
+
+        self.task.estimated_minutes = 480
+        self.task.save()
+        self.end = self.start + timedelta(hours=1)
+        self.assertEqual(self.propose().status_code, 409)
+        self.mock_api.return_value = {}
+        self.mock_api.side_effect = None
+        self.assertEqual(self.propose().status_code, 502)
+        self.assertFalse(WorkSession.objects.exists())
+
+    def test_deadline_and_completed_tasks(self):
+        self.task.due_date = (self.start - timedelta(days=1)).date()
+        self.task.save()
+        self.assertEqual(self.propose().status_code, 409)
+        self.task.is_completed = True
+        self.task.save()
+        self.assertEqual(self.propose().status_code, 400)
+
+    def test_approval_publishes_once_and_replays_without_write(self):
+        session = self.session()
+        with patch('calendars.sessions.event_request', return_value=(200, session.event_payload)) as event:
+            response = self.approve(session)
+            self.assertEqual(response.status_code, 200, response.data)
+            self.assertEqual(response.data['status'], 'published')
+            self.assertEqual(self.approve(session).status_code, 200)
+            self.assertEqual(event.call_count, 1)
+        self.assertEqual(self.propose().status_code, 409)
+
+    def test_changed_task_and_rules_block_approval(self):
+        from .models import ProtectedPeriod
+
+        session = self.session()
+        self.task.title = 'Different work'
+        self.task.save()
+        with patch('calendars.sessions.event_request') as event:
+            self.assertEqual(self.approve(session).status_code, 409)
+            event.assert_not_called()
+        self.task.title = session.task_snapshot['title']
+        self.task.save()
+        ProtectedPeriod.objects.create(user=self.user, kind='one_off', starts_at=session.starts_at, ends_at=session.ends_at)
+        with patch('calendars.sessions.event_request') as event:
+            self.assertEqual(self.approve(session).status_code, 409)
+            event.assert_not_called()
+
+    def test_new_busy_event_blocks_approval(self):
+        session = self.session()
+        self.mock_api.side_effect = lambda user, method, path, **kwargs: {'calendars': {
+            i['id']: {'busy': [{'start': session.starts_at.isoformat(), 'end': session.ends_at.isoformat()}]}
+            for i in kwargs['json']['items']}}
+        with patch('calendars.sessions.event_request') as event:
+            self.assertEqual(self.approve(session).status_code, 409)
+            event.assert_not_called()
+
+    def test_timeout_reconciles_same_event_without_reinsertion(self):
+        session = self.session()
+        with patch('calendars.sessions.event_request', side_effect=services.CalendarError()):
+            self.assertEqual(self.approve(session).status_code, 502)
+        session.refresh_from_db()
+        self.assertEqual(session.status, 'publishing')
+        with patch('calendars.sessions.event_request', return_value=(200, session.event_payload)) as event:
+            self.assertEqual(self.approve(session).status_code, 200)
+            self.assertEqual(event.call_count, 1)
+            self.assertEqual(event.call_args.args[2], 'GET')
+
+    def test_retry_missing_event_reuses_fixed_id_and_handles_duplicate(self):
+        session = self.session()
+        session.status = 'publishing'
+        session.save()
+        with patch('calendars.sessions.event_request', side_effect=[(404, {}), (409, {}), (200, session.event_payload)]) as event:
+            self.assertEqual(self.approve(session).status_code, 200)
+            self.assertEqual([c.args[2] for c in event.call_args_list], ['GET', 'POST', 'GET'])
+            self.assertEqual(event.call_args_list[1].args[3]['id'], session.google_event_id)
+
+    def test_different_existing_event_is_never_overwritten(self):
+        session = self.session()
+        session.status = 'publishing'
+        session.save()
+        with patch('calendars.sessions.event_request', return_value=(200, {'id': session.google_event_id})) as event:
+            self.assertEqual(self.approve(session).status_code, 409)
+            self.assertEqual(event.call_count, 1)
+
+    def test_reject_expiry_and_missing_task(self):
+        session = self.session()
+        self.assertEqual(self.client.post(f'/api/sessions/{session.pk}/reject/').status_code, 200)
+        self.assertEqual(self.approve(session).status_code, 409)
+        session = self.session()
+        session.expires_at = timezone.now() - timedelta(seconds=1)
+        session.save()
+        self.assertEqual(self.approve(session).status_code, 409)
+        session = self.session()
+        self.task.delete()
+        self.assertEqual(self.approve(session).status_code, 409)
+
+    def test_user_isolation(self):
+        session = self.session()
+        other = get_user_model().objects.create_user(email='other-session@gmail.com')
+        self.client.force_authenticate(other)
+        self.assertEqual(self.propose().status_code, 404)
+        self.assertEqual(self.approve(session).status_code, 404)
+        self.assertEqual(self.client.get(f'/api/sessions/{session.pk}/').status_code, 404)
+        self.assertEqual(self.client.patch(f'/api/tasks/{self.task.pk}/', {'title': 'Changed'}, format='json').status_code, 404)
+        self.assertEqual(self.client.post('/api/tasks/', {'goal_id': str(self.goal.pk), 'title': 'Changed'}, format='json').status_code, 404)
+
+    def test_publishing_intent_prevents_rejection_and_second_proposal(self):
+        session = self.session()
+        session.status = 'publishing'
+        session.save()
+        self.assertEqual(self.client.post(f'/api/sessions/{session.pk}/reject/').status_code, 409)
+        self.assertEqual(self.propose().status_code, 409)
+        response = self.client.patch(f'/api/tasks/{self.task.pk}/', {'title': 'Changed'}, format='json')
+        self.assertEqual(response.status_code, 400)
+
+    def test_destinations_are_rechecked_and_changes_require_new_proposal(self):
+        session = self.session()
+        CalendarConnection.objects.filter(user=self.user).update(destination_calendar='different')
+        with patch('calendars.sessions.event_request') as event:
+            self.assertEqual(self.approve(session).status_code, 409)
+            event.assert_not_called()
+
+    def test_approval_lease_blocks_simultaneous_calls_and_recovers_after_crash(self):
+        import uuid
+
+        session = self.session()
+        session.publish_attempt = uuid.uuid4()
+        session.lease_until = timezone.now() + timedelta(minutes=1)
+        session.save()
+        with patch('calendars.sessions.event_request') as event:
+            self.assertEqual(self.approve(session).status_code, 409)
+            event.assert_not_called()
+        session.lease_until = timezone.now() - timedelta(seconds=1)
+        session.save()
+        with patch('calendars.sessions.event_request', return_value=(200, session.event_payload)):
+            self.assertEqual(self.approve(session).status_code, 200)
+        session.refresh_from_db()
+        self.assertIsNone(session.publish_attempt)
+        self.assertIsNone(session.lease_until)
+
+    def test_deleted_restored_task_cannot_duplicate_published_session(self):
+        from tasks.models import Task
+
+        session = self.session()
+        with patch('calendars.sessions.event_request', return_value=(200, session.event_payload)):
+            self.assertEqual(self.approve(session).status_code, 200)
+        pk = self.task.pk
+        self.task.delete()
+        self.task = Task.objects.create(pk=pk, goal=self.goal, title='Restored', estimated_minutes=60,
+                                        readiness='ready', completion_criteria='Done')
+        self.assertEqual(self.propose().status_code, 409)
+
+    def test_actual_event_transport_uses_fixed_id_and_marks_revocation(self):
+        from . import sessions
+        import uuid
+
+        session = self.session()
+        session.status = 'publishing'
+        session.publish_attempt = uuid.uuid4()
+        session.lease_until = timezone.now() + timedelta(minutes=2)
+        session.save()
+        with patch('calendars.services.access_token', return_value='provider-token'), patch(
+            'calendars.services.request_json', return_value=(200, session.event_payload)
+        ) as transport:
+            status, _ = sessions.event_request(self.user, session, 'POST', session.event_payload)
+            self.assertEqual(status, 200)
+            self.assertIn('/calendars/target/events', transport.call_args.args[1])
+            self.assertEqual(transport.call_args.kwargs['json']['id'], session.google_event_id)
+            self.assertNotIn('attendees', transport.call_args.kwargs['json'])
+        with patch('calendars.services.access_token', return_value='provider-token'), patch(
+            'calendars.services.request_json', return_value=(401, {})
+        ), self.assertRaises(services.ReconnectRequired):
+            sessions.event_request(self.user, session, 'GET')
+        self.assertTrue(CalendarConnection.objects.get(user=self.user).reconnect_required)
+
+    def test_different_timezone_changes_deadline_at_approval(self):
+        from .models import SchedulingPreferences
+
+        self.start += timedelta(hours=2)
+        self.task.due_date = self.start.date()
+        self.task.save()
+        session = self.session()
+        # Moving the local deadline into an earlier UTC instant must invalidate the slot.
+        SchedulingPreferences.objects.filter(user=self.user).update(timezone='Pacific/Kiritimati')
+        with patch('calendars.sessions.event_request') as event:
+            response = self.approve(session)
+            self.assertEqual(response.status_code, 409)
+            event.assert_not_called()
+
+    def test_rule_change_just_before_insert_does_not_trap_unsubmitted_session(self):
+        from . import sessions
+        from .models import ProtectedPeriod
+
+        session = self.session()
+        transport = sessions.event_request
+        def change_rules(user, current, method, payload=None):
+            ProtectedPeriod.objects.create(user=user, kind='one_off',
+                                           starts_at=current.starts_at, ends_at=current.ends_at)
+            return transport(user, current, method, payload)
+        with patch('calendars.sessions.event_request', side_effect=change_rules), patch(
+            'calendars.services.access_token', return_value='token'
+        ), patch('calendars.services.request_json') as google:
+            self.assertEqual(self.approve(session).status_code, 409)
+            google.assert_not_called()
+        session.refresh_from_db()
+        self.assertEqual(session.status, 'proposed')
+        self.assertEqual(self.client.post(f'/api/sessions/{session.pk}/reject/').status_code, 200)
