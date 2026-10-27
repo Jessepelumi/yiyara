@@ -1,6 +1,7 @@
 from datetime import date
 
 from django.core.exceptions import ValidationError
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
 
@@ -34,6 +35,9 @@ def serialize_plan_snapshot(plan):
                         "description": task.description,
                         "due_date": task.due_date.isoformat() if task.due_date else None,
                         "is_completed": task.is_completed,
+                        "estimated_minutes": task.estimated_minutes,
+                        "completion_criteria": task.completion_criteria,
+                        "readiness": task.readiness,
                     }
                     for task in goal.tasks.all().order_by("created_at")
                 ],
@@ -241,6 +245,7 @@ def create_plan_change(plan, scope_goal, summary, operations):
 
 def apply_plan_change(change, user):
     with transaction.atomic():
+        get_user_model().objects.select_for_update().get(pk=user.pk)
         change = (
             PlanChange.objects.select_for_update()
             .select_related("plan")
@@ -329,6 +334,7 @@ def reject_plan_change(change, user):
 
 def restore_plan_revision(revision, user):
     with transaction.atomic():
+        get_user_model().objects.select_for_update().get(pk=user.pk)
         plan = Plan.objects.select_for_update().get(
             id=revision.plan_id,
             user=user,
@@ -370,6 +376,9 @@ def restore_plan_revision(revision, user):
                         "description": item.get("description", ""),
                         "due_date": item.get("due_date"),
                         "is_completed": item.get("is_completed", False),
+                        "estimated_minutes": item.get("estimated_minutes"),
+                        "completion_criteria": item.get("completion_criteria", ""),
+                        "readiness": item.get("readiness", "draft"),
                     },
                 )
 
