@@ -21,3 +21,39 @@ class CalendarAuthorization(models.Model):
     verifier = models.TextField()  # Encrypted PKCE verifier and OIDC nonce.
     expires_at = models.DateTimeField()
     used = models.BooleanField(default=False)
+
+
+class SchedulingPreferences(models.Model):
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    timezone = models.CharField(max_length=100)
+    working_hours = models.JSONField(default=list)
+    preferred_session_minutes = models.PositiveIntegerField(default=60)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class ProtectedPeriod(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    title = models.CharField(max_length=200, blank=True)
+    kind = models.CharField(max_length=10, choices=[("one_off", "One off"), ("weekly", "Weekly")])
+    starts_at = models.DateTimeField(null=True, blank=True)
+    ends_at = models.DateTimeField(null=True, blank=True)
+    weekdays = models.JSONField(default=list, blank=True)
+    all_day = models.BooleanField(default=False)
+    start_time = models.TimeField(null=True, blank=True)
+    end_time = models.TimeField(null=True, blank=True)
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(kind="one_off", starts_at__isnull=False, ends_at__isnull=False,
+                             ends_at__gt=models.F("starts_at"))
+                    | models.Q(kind="weekly", starts_at__isnull=True, ends_at__isnull=True)
+                ),
+                name="protected_period_valid_kind_and_range",
+            ),
+        ]
