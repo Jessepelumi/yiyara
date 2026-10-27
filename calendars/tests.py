@@ -242,3 +242,167 @@ class CalendarTests(APITestCase):
         RedactCalendarCallback().filter(record)
         self.assertNotIn("secret", record.getMessage())
         self.assertNotIn("proof", record.getMessage())
+
+
+class SchedulingRulesTests(APITestCase):
+    preferences_url = "/api/calendar/scheduling-preferences/"
+    periods_url = "/api/calendar/protected-periods/"
+    windows_url = "/api/calendar/scheduling-windows/"
+
+    def setUp(self):
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.user = get_user_model().objects.create_user(email="scheduler@gmail.com")
+        self.client.force_authenticate(self.user)
+        self.preferences = {
+            "timezone": "Europe/London", "preferred_session_minutes": 60,
+            "working_hours": [{"weekday": 0, "start_time": "09:00", "end_time": "17:00"}],
+        }
+
+    def configure(self, **changes):
+        response = self.client.put(self.preferences_url, {**self.preferences, **changes}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        return response
+
+    def weekly(self, **changes):
+        return self.client.post(self.periods_url, {
+            "kind": "weekly", "title": "Lunch", "weekdays": [0],
+            "start_time": "12:00", "end_time": "13:00", **changes,
+        }, format="json")
+
+    def preview(self, start="2026-11-02T00:00:00Z", end="2026-11-03T00:00:00Z"):
+        return self.client.post(self.windows_url, {"time_min": start, "time_max": end}, format="json")
+
+    def test_requires_authentication_and_explicit_setup(self):
+        self.assertEqual(self.client.get(self.preferences_url).data, {"configured": False})
+        self.assertEqual(self.preview().status_code, 400)
+        self.assertEqual(self.weekly().status_code, 400)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get(self.preferences_url).status_code, 401)
+        self.assertEqual(self.client.get(self.periods_url).status_code, 401)
+        self.assertEqual(self.preview().status_code, 401)
+
+    def test_preferences_roundtrip_and_replace_without_google_connection(self):
+        self.configure()
+        self.assertEqual(self.client.get(self.preferences_url).data["timezone"], "Europe/London")
+        self.configure(working_hours=[])
+        self.assertEqual(self.preview().data["windows"], [])
+
+    def test_invalid_preferences_do_not_replace_existing_rules(self):
+        self.configure()
+        invalid = [
+            {"timezone": "Not/AZone"}, {"preferred_session_minutes": 0},
+            {"working_hours": [{"weekday": 7, "start_time": "09:00", "end_time": "17:00"}]},
+            {"working_hours": [{"weekday": 0, "start_time": "17:00", "end_time": "09:00"}]},
+            {"working_hours": [{"weekday": 0, "start_time": "09:00:01", "end_time": "17:00"}]},
+            {"working_hours": [self.preferences["working_hours"][0], {"weekday": 0, "start_time": "16:00", "end_time": "18:00"}]},
+        ]
+        for changes in invalid:
+            with self.subTest(changes=changes):
+                self.assertEqual(self.client.put(self.preferences_url, {**self.preferences, **changes}, format="json").status_code, 400)
+        self.assertEqual(self.client.get(self.preferences_url).data["working_hours"][0]["start_time"], "09:00")
+
+    def test_weekly_and_one_off_subtracted_and_clipped_exactly(self):
+        self.configure()
+        self.assertEqual(self.weekly().status_code, 201)
+        response = self.client.post(self.periods_url, {
+            "kind": "one_off", "starts_at": "2026-11-02T14:00:15Z", "ends_at": "2026-11-02T15:00:30Z",
+        }, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        response = self.preview()
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["google_busy_time_checked"])
+        windows = response.data["windows"]
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(windows[0]["starts_at"].hour, 9)
+        self.assertEqual(windows[0]["ends_at"].hour, 12)
+        self.assertEqual(windows[1]["ends_at"].second, 15)
+        self.assertEqual(windows[2]["starts_at"].second, 30)
+        self.assertEqual(windows[2]["ends_at"].hour, 17)
+        clipped = self.preview("2026-11-02T09:00:30Z", "2026-11-02T10:00:15Z").data["windows"]
+        self.assertEqual(clipped[0]["starts_at"].second, 30)
+        self.assertEqual(clipped[0]["ends_at"].second, 15)
+
+    def test_grey_period_crud_and_overlap(self):
+        self.configure()
+        first = self.weekly()
+        self.assertEqual(self.weekly(start_time="12:30", end_time="14:00").status_code, 201)
+        self.assertEqual(self.preview().data["windows"][1]["starts_at"].hour, 14)
+        url = self.periods_url + str(first.data["id"]) + "/"
+        self.assertEqual(self.client.get(url).status_code, 200)
+        self.assertEqual(self.client.patch(url, {"title": "Break"}, format="json").status_code, 200)
+        self.assertEqual(self.client.delete(url).status_code, 204)
+        self.assertEqual(self.client.get(url).status_code, 404)
+        self.assertEqual(len(self.client.get(self.periods_url).data["protected_periods"]), 1)
+
+    def test_invalid_grey_periods(self):
+        self.configure()
+        for changes in ({"weekdays": []}, {"weekdays": [0, 0]}, {"weekdays": [7]},
+                        {"start_time": "22:00", "end_time": "08:00"},
+                        {"all_day": True}, {"start_date": "2026-11-10", "end_date": "2026-11-01"},
+                        {"starts_at": "2026-11-02T00:00:00Z"}):
+            with self.subTest(changes=changes):
+                self.assertEqual(self.weekly(**changes).status_code, 400)
+        for start, end in (("2026-11-02T10:00:00", "2026-11-02T11:00:00Z"),
+                           ("2026-11-02T11:00:00Z", "2026-11-02T10:00:00Z")):
+            self.assertEqual(self.client.post(self.periods_url, {
+                "kind": "one_off", "starts_at": start, "ends_at": end,
+            }, format="json").status_code, 400)
+
+    def test_all_day_and_date_bounded_recurrence(self):
+        self.configure()
+        response = self.weekly(all_day=True, start_time=None, end_time=None,
+                               start_date="2026-11-02", end_date="2026-11-02")
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(self.preview().data["windows"], [])
+        self.assertEqual(len(self.preview("2026-11-09T00:00:00Z", "2026-11-10T00:00:00Z").data["windows"]), 1)
+
+    def test_partial_update_revalidates_existing_range(self):
+        self.configure()
+        response = self.weekly()
+        url = self.periods_url + str(response.data["id"]) + "/"
+        self.assertEqual(self.client.patch(url, {"end_time": "11:00"}, format="json").status_code, 400)
+        self.assertEqual(self.client.get(url).data["end_time"], "13:00:00")
+
+    def test_user_isolation(self):
+        self.configure()
+        response = self.weekly()
+        url = self.periods_url + str(response.data["id"]) + "/"
+        other = get_user_model().objects.create_user(email="outsider@gmail.com")
+        self.client.force_authenticate(other)
+        self.assertFalse(self.client.get(self.preferences_url).data["configured"])
+        self.assertEqual(self.client.get(self.periods_url).data["protected_periods"], [])
+        self.assertEqual(self.client.get(url).status_code, 404)
+        self.assertEqual(self.client.patch(url, {"title": "Changed"}, format="json").status_code, 404)
+        self.assertEqual(self.client.delete(url).status_code, 404)
+
+    def test_rule_limit(self):
+        from .models import ProtectedPeriod
+
+        self.configure()
+        ProtectedPeriod.objects.bulk_create([
+            ProtectedPeriod(user=self.user, kind="weekly", weekdays=[0], all_day=True) for _ in range(100)
+        ])
+        self.assertEqual(self.weekly().status_code, 400)
+
+    def test_dst_fall_back_protects_both_repeated_hours(self):
+        self.configure(working_hours=[{"weekday": 6, "start_time": "00:00", "end_time": "04:00"}])
+        self.assertEqual(self.weekly(weekdays=[6], start_time="01:00", end_time="02:00").status_code, 201)
+        response = self.preview("2026-10-25T00:00:00Z", "2026-10-25T04:00:00Z")
+        self.assertEqual(len(response.data["windows"]), 1)
+        self.assertEqual(response.data["windows"][0]["starts_at"].hour, 2)
+
+    def test_dst_spring_forward_and_timezone_change(self):
+        self.configure(working_hours=[{"weekday": 6, "start_time": "00:00", "end_time": "04:00"}])
+        windows = self.preview("2027-03-28T00:00:00Z", "2027-03-28T04:00:00Z").data["windows"]
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0]["ends_at"].hour, 3)
+        self.configure(timezone="America/New_York")
+        windows = self.preview().data["windows"]
+        self.assertEqual(windows[0]["starts_at"].hour, 14)
+
+    def test_no_google_requests_for_local_rules(self):
+        self.configure()
+        with patch("calendars.services.api") as google:
+            self.assertEqual(self.preview().status_code, 200)
+            google.assert_not_called()
