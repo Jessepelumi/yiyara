@@ -164,6 +164,9 @@ class DeleteGoalView(APIView):
         
         try:
             with transaction.atomic():
+                from django.contrib.auth import get_user_model
+
+                get_user_model().objects.select_for_update().get(pk=request.user.pk)
                 plan = Plan.objects.select_for_update().get(id=goal.plan_id)
                 if plan.goals.count() <= 1:
                     return Response(
