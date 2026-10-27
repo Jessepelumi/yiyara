@@ -95,10 +95,43 @@ class AvailabilityView(CalendarView):
             "items": [{"id": c} for c in connection.source_calendars],
         })
         calendars = payload.get("calendars", {})
+        if not isinstance(calendars, dict):
+            calendars = {}
+        failures = []
         for calendar in connection.source_calendars:
             result = calendars.get(calendar)
-            if not isinstance(result, dict) or result.get("errors") or not isinstance(result.get("busy"), list):
-                raise services.CalendarError("Availability is incomplete. Check calendar access and retry.")
+            if isinstance(result, dict) and not result.get("errors") and isinstance(result.get("busy"), list):
+                continue
+            errors = result.get("errors", []) if isinstance(result, dict) else []
+            reasons = {
+                error.get("reason") for error in errors if isinstance(error, dict)
+                and isinstance(error.get("reason"), str)
+            } if isinstance(errors, list) else set()
+            selection_error = bool(reasons) and reasons.issubset({"notFound", "forbidden"})
+            failures.append({
+                "calendar_id": calendar,
+                "code": "calendar_unavailable" if selection_error else "lookup_failed",
+                "detail": (
+                    "This calendar is inaccessible or does not support availability lookup. "
+                    "Public holiday calendars may not support it."
+                    if selection_error else
+                    "Google did not return complete availability for this calendar. Retry later."
+                ),
+            })
+        if failures:
+            selection_only = all(error["code"] == "calendar_unavailable" for error in failures)
+            return Response({
+                "code": "invalid_availability_calendars" if selection_only else "availability_incomplete",
+                "detail": (
+                    "Update source_calendars using PUT /api/calendar/preferences/. "
+                    "Choose your primary calendar or another calendar that supports availability. "
+                    "Use GET /api/calendar/calendars/ to find its ID."
+                    if selection_only else
+                    "Availability could not be confirmed for every selected calendar. "
+                    "Retry later and review any unavailable calendars listed below."
+                ),
+                "calendar_errors": failures,
+            }, status=400 if selection_only else 502)
         return Response({
             "time_min": data["time_min"], "time_max": data["time_max"],
             "calendars": {c: {"busy": calendars[c]["busy"]} for c in connection.source_calendars},
