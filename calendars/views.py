@@ -1,4 +1,5 @@
 from django.db import transaction
+from django.shortcuts import get_object_or_404
 from rest_framework import permissions
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
@@ -6,8 +7,11 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from . import services
-from .models import CalendarConnection
-from .serializers import AvailabilitySerializer, PreferencesSerializer
+from .models import CalendarConnection, ProtectedPeriod, SchedulingPreferences
+from .serializers import (
+    AvailabilitySerializer, PreferencesSerializer, ProtectedPeriodSerializer,
+    SchedulingPreferencesSerializer,
+)
 
 
 class CalendarView(APIView):
@@ -135,4 +139,82 @@ class AvailabilityView(CalendarView):
         return Response({
             "time_min": data["time_min"], "time_max": data["time_max"],
             "calendars": {c: {"busy": calendars[c]["busy"]} for c in connection.source_calendars},
+        })
+
+
+class SchedulingPreferencesView(CalendarView):
+    def get(self, request):
+        preferences = SchedulingPreferences.objects.filter(user=request.user).first()
+        if not preferences:
+            return Response({"configured": False})
+        return Response({"configured": True, **SchedulingPreferencesSerializer(preferences).data})
+
+    def put(self, request):
+        serializer = SchedulingPreferencesSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            services.lock_user(request.user)
+            preferences, _ = SchedulingPreferences.objects.update_or_create(
+                user=request.user, defaults=serializer.validated_data
+            )
+        return Response({"configured": True, **SchedulingPreferencesSerializer(preferences).data})
+
+
+class ProtectedPeriodsView(CalendarView):
+    def get(self, request):
+        return Response({"protected_periods": ProtectedPeriodSerializer(
+            ProtectedPeriod.objects.filter(user=request.user), many=True
+        ).data})
+
+    def post(self, request):
+        serializer = ProtectedPeriodSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            services.lock_user(request.user)
+            if not SchedulingPreferences.objects.filter(user=request.user).exists():
+                raise ValidationError("Set scheduling preferences and timezone first.")
+            if ProtectedPeriod.objects.filter(user=request.user).count() >= 100:
+                raise ValidationError("Keep no more than 100 protected periods; edit or delete an existing period.")
+            period = serializer.save(user=request.user)
+        return Response(ProtectedPeriodSerializer(period).data, status=201)
+
+
+class ProtectedPeriodDetailView(CalendarView):
+    def get(self, request, period_id):
+        period = get_object_or_404(ProtectedPeriod, pk=period_id, user=request.user)
+        return Response(ProtectedPeriodSerializer(period).data)
+
+    def patch(self, request, period_id):
+        with transaction.atomic():
+            services.lock_user(request.user)
+            period = get_object_or_404(ProtectedPeriod, pk=period_id, user=request.user)
+            serializer = ProtectedPeriodSerializer(period, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+        return Response(serializer.data)
+
+    def delete(self, request, period_id):
+        with transaction.atomic():
+            services.lock_user(request.user)
+            get_object_or_404(ProtectedPeriod, pk=period_id, user=request.user).delete()
+        return Response(status=204)
+
+
+class SchedulingWindowsView(CalendarView):
+    def post(self, request):
+        from .scheduling import permitted_windows
+
+        serializer = AvailabilitySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        # Read one consistent ruleset while preferences/protected periods may change.
+        with transaction.atomic():
+            services.lock_user(request.user)
+            windows = permitted_windows(request.user, data["time_min"], data["time_max"])
+        if windows is None:
+            raise ValidationError("Set scheduling preferences and timezone first.")
+        return Response({
+            "time_min": data["time_min"], "time_max": data["time_max"],
+            "google_busy_time_checked": False,
+            "windows": [{"starts_at": start, "ends_at": end} for start, end in windows],
         })
