@@ -163,7 +163,44 @@ class CalendarTests(APITestCase):
         with patch("calendars.services.api", return_value={"calendars": {"owned": {"busy": []}}}):
             self.assertEqual(self.client.post("/api/calendar/availability/", query, format="json").status_code, 200)
         with patch("calendars.services.api", return_value={"calendars": {"owned": {"errors": [{"reason": "notFound"}]}}}):
-            self.assertEqual(self.client.post("/api/calendar/availability/", query, format="json").status_code, 502)
+            response = self.client.post("/api/calendar/availability/", query, format="json")
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.data["code"], "invalid_availability_calendars")
+            self.assertEqual(response.data["calendar_errors"][0]["calendar_id"], "owned")
+            self.assertIn("/api/calendar/preferences/", response.data["detail"])
+            self.assertNotIn("calendars", response.data)
+        self.assertEqual(CalendarConnection.objects.get().source_calendars, ["owned"])
+
+    def test_availability_errors_distinguish_selection_from_provider_failures(self):
+        self.connection(source_calendars=["owned", "shared"])
+        query = {"time_min": "2026-11-01T00:00:00Z", "time_max": "2026-11-02T00:00:00Z"}
+        for reason, expected in (("forbidden", 400), ("internalError", 502), ("unknown", 502)):
+            with self.subTest(reason=reason), patch("calendars.services.api", return_value={
+                "calendars": {"owned": {"busy": []}, "shared": {"errors": [{"reason": reason}]}}
+            }):
+                response = self.client.post("/api/calendar/availability/", query, format="json")
+                self.assertEqual(response.status_code, expected)
+                self.assertEqual([e["calendar_id"] for e in response.data["calendar_errors"]], ["shared"])
+                self.assertNotIn("calendars", response.data)
+        with patch("calendars.services.api", return_value={"calendars": {
+            "owned": {"errors": [{"reason": "notFound"}]},
+            "shared": {"errors": [{"reason": "internalError"}]},
+        }}):
+            response = self.client.post("/api/calendar/availability/", query, format="json")
+            self.assertEqual(response.status_code, 502)
+            self.assertEqual(response.data["code"], "availability_incomplete")
+            self.assertEqual(len(response.data["calendar_errors"]), 2)
+
+    def test_missing_or_malformed_availability_is_not_free_time(self):
+        self.connection()
+        query = {"time_min": "2026-11-01T00:00:00Z", "time_max": "2026-11-02T00:00:00Z"}
+        for payload in ({}, {"calendars": None}, {"calendars": {"owned": {}}},
+                        {"calendars": {"owned": {"errors": "invalid"}}}):
+            with self.subTest(payload=payload), patch("calendars.services.api", return_value=payload):
+                response = self.client.post("/api/calendar/availability/", query, format="json")
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(response.data["code"], "availability_incomplete")
+                self.assertNotIn("calendars", response.data)
 
     def test_availability_rejects_unbounded_and_naive_ranges(self):
         self.connection()
