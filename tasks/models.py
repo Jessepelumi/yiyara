@@ -29,6 +29,12 @@ class Task(models.Model):
         db_index=True
     )
     is_completed = models.BooleanField(default=False)
+    estimated_minutes = models.PositiveIntegerField(null=True, blank=True)
+    completion_criteria = models.TextField(blank=True)
+    readiness = models.CharField(
+        max_length=10, choices=[("draft", "Draft"), ("ready", "Ready"), ("blocked", "Blocked")],
+        default="draft",
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
