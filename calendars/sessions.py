@@ -24,14 +24,21 @@ def snapshot(task):
     return {"task_id": str(task.pk), "title": task.title, "description": task.description,
             "completion_criteria": task.completion_criteria, "estimated_minutes": task.estimated_minutes,
             "readiness": task.readiness, "due_date": str(task.due_date) if task.due_date else None,
-            "goal_due_date": str(task.goal.due_date) if task.goal.due_date else None}
+            "goal_due_date": str(task.goal.due_date) if task.goal.due_date else None,
+            "dependencies": sorted(str(pk) for pk in task.dependencies.values_list('pk', flat=True)),
+            "blocker_reason": task.blocker_reason, "planning_context_version": task.planning_context_version}
+
+
+def matches_snapshot(task, saved):
+    # Previously created proposals predate dependency/context fields.
+    return snapshot(task) == {"dependencies": [], "blocker_reason": "", "planning_context_version": None, **saved}
 
 
 def ready(task):
-    if (task.is_completed or task.goal.is_completed or task.goal.plan.status != 'active'
-            or task.readiness != 'ready' or not task.completion_criteria.strip()
-            or not task.estimated_minutes or not 5 <= task.estimated_minutes <= 480):
-        raise ValidationError('Task must be unfinished, ready, and have effort and completion criteria in an active plan.')
+    from tasks.dependencies import scheduling_blockers
+    blockers = scheduling_blockers(task)
+    if blockers:
+        raise ValidationError({'task': blockers})
 
 
 def deadline(task, preferences):
@@ -176,7 +183,7 @@ def _event_request(user, session, method, payload, write_state):
             if not task:
                 raise SessionConflict('Task no longer exists.')
             ready(task)
-            if snapshot(task) != session.task_snapshot:
+            if not matches_snapshot(task, session.task_snapshot):
                 raise SessionConflict('Task changed before publishing.')
             preferences = SchedulingPreferences.objects.get(user=user)
             due = deadline(task, preferences)
@@ -262,7 +269,7 @@ def _approve(user, session_id):
             raise SessionConflict('The original task no longer exists.')
         task = Task.objects.select_related('goal__plan').get(pk=session.task_id)
         ready(task)
-        if snapshot(task) != session.task_snapshot:
+        if not matches_snapshot(task, session.task_snapshot):
             raise SessionConflict('Task changed. Request a new proposal.')
         preferences = SchedulingPreferences.objects.filter(user=user).first()
         if not preferences:
