@@ -182,6 +182,7 @@ REST_FRAMEWORK = {
         "auth_refresh": "20/min",
         "auth_logout": "20/min",
         "calendar": "30/min",
+        "task_planning": "10/min",
     },
 }
 
@@ -218,6 +219,7 @@ AI_PROVIDER_ORDER = env_list(
 )
 
 AI_ROUTES = {
+    "task_planning": env_list("AI_TASK_PLANNING_PROVIDERS", AI_PROVIDER_ORDER),
     "goal_decomposition": env_list(
         "AI_DECOMPOSITION_PROVIDERS",
         AI_PROVIDER_ORDER,
