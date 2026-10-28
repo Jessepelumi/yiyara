@@ -419,3 +419,224 @@ class GeminiProviderTests(TestCase):
         deadline_http_options = client_class.call_args.kwargs["http_options"]
         self.assertEqual(deadline_http_options.timeout, 5000)
         deadline_client.close.assert_called_once_with()
+
+
+class ContextualPlanningTests(TestCase):
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.user = User.objects.create_user(email='clarification@example.com')
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        response = self.client.post('/api/plans/', {'text': 'Learn to drive'}, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        self.plan = Plan.objects.get(pk=response.data['id'])
+        self.question = self.plan.questions.get()
+        self.chat_url = f'/api/conversations/plans/{self.plan.pk}/messages/'
+
+    def chat(self, content, operations, client_id=None, version=None):
+        import json
+        import uuid
+
+        gateway = Mock()
+        def generate(**kwargs):
+            current = json.loads(kwargs['prompt'])
+            source = current['current_user_message_id']
+            changes = operations(source) if callable(operations) else operations
+            return {'reply': 'Please review these proposed context updates.', 'summary': 'Clarification', 'changes': changes}
+        gateway.generate_json.side_effect = generate
+        data = {'content': content, 'client_id': str(client_id or uuid.uuid4())}
+        if version is not None:
+            data['plan_version'] = version
+        with patch('conversations.clarification.get_ai_gateway', return_value=gateway):
+            response = self.client.post(self.chat_url, data, format='json')
+        return response, gateway, data
+
+    def apply(self, response):
+        return self.client.post(f"/api/conversations/plans/{self.plan.pk}/changes/{response.data['change']['id']}/apply/")
+
+    def test_intake_is_saved_without_ai_and_without_goals(self):
+        with patch('workflow.ai_engine.get_ai_gateway', side_effect=AssertionError('Must not call AI')):
+            response = self.client.post('/api/plans/', {'text': 'Learn DSA'}, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['planning_state'], 'clarifying')
+        self.assertEqual(response.data['planning_mode'], 'contextual')
+        self.assertEqual(response.data['goals'], [])
+        self.assertEqual(len(response.data['questions']), 1)
+        self.assertEqual(self.plan.goals.count(), 0)
+        self.assertTrue(self.plan.revisions.filter(version=1).exists())
+        self.assertEqual(self.client.get(f'/api/plans/{self.plan.pk}/').data['context']['desired_outcome'], 'Learn to drive')
+
+    def test_answer_persists_without_ai_and_replay_is_idempotent(self):
+        url = f'/api/plans/{self.plan.pk}/questions/{self.question.pk}/answer/'
+        data = {'answer': 'I have not chosen a driving school.', 'plan_version': 1}
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['context']['starting_point'], data['answer'])
+        self.assertEqual(response.data['questions'][0]['status'], 'answered')
+        self.assertEqual(response.data['version'], 2)
+        replay = self.client.post(url, data, format='json')
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(replay.data['version'], 2)
+        self.assertEqual(self.client.post(url, {**data, 'answer': 'Different answer'}, format='json').status_code, 409)
+
+    def test_reviewed_ai_changes_save_answers_and_follow_up_questions(self):
+        content = 'I have never driven and have not found a school.'
+        response, _, _ = self.chat(content, lambda source: [
+            {'action': 'answer_question', 'question_id': str(self.question.pk), 'answer': content, 'source_message_id': source},
+            {'action': 'ask_question', 'field': 'timing', 'text': 'When would you like to start lessons?', 'required': False},
+        ])
+        self.assertEqual(response.status_code, 201, response.data)
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.context['starting_point'], '')
+        self.assertEqual(self.plan.questions.count(), 1)
+        applied = self.apply(response)
+        self.assertEqual(applied.status_code, 200, applied.data)
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.context['starting_point'], content)
+        self.assertEqual(self.plan.questions.count(), 2)
+        self.assertEqual(self.plan.goals.count(), 0)
+
+    def test_unverified_facts_are_rejected_and_message_survives(self):
+        response, _, _ = self.chat('I want to start in June.', lambda source: [
+            {'action': 'update_context', 'timing': '2027-06-01', 'source_message_id': source},
+        ])
+        self.assertEqual(response.status_code, 502)
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.context['timing'], '')
+        self.assertFalse(self.plan.changes.exists())
+        self.assertEqual(self.plan.conversation.messages.latest('created_at').metadata['ai_status'], 'failed')
+
+    def test_assumptions_remain_distinct_and_context_accumulates(self):
+        first = 'I can study on weekdays.'
+        response, _, _ = self.chat(first, lambda source: [
+            {'action': 'update_context', 'constraints': [first], 'source_message_id': source,
+             'assumptions': ['Weekends may be unavailable.']},
+        ])
+        self.assertEqual(self.apply(response).status_code, 200)
+        second = 'My budget is limited.'
+        response, _, _ = self.chat(second, lambda source: [
+            {'action': 'update_context', 'constraints': [second], 'source_message_id': source},
+        ])
+        self.assertEqual(self.apply(response).status_code, 200)
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.context['constraints'], [first, second])
+        self.assertEqual(self.plan.context['assumptions'], ['Weekends may be unavailable.'])
+        self.assertEqual(self.plan.context_provenance['assumptions']['kind'], 'assumption')
+
+    def test_context_corrections_and_waiting_state_validation(self):
+        url = f'/api/plans/{self.plan.pk}/context/'
+        self.assertEqual(self.client.patch(url, {'plan_version': 1, 'planning_state': 'waiting'}, format='json').status_code, 400)
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.version, 1)
+        response = self.client.patch(url, {'plan_version': 1, 'starting_point': 'I already have an instructor.'}, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['context']['starting_point'], 'I already have an instructor.')
+        self.assertEqual(self.client.patch(url, {'plan_version': 1, 'timing': 'Tomorrow'}, format='json').status_code, 409)
+
+    def test_deferred_question_waits_without_fabricating_answer(self):
+        response, _, _ = self.chat('I am waiting to hear back.', [
+            {'action': 'defer_question', 'question_id': str(self.question.pk), 'reason': 'Waiting for a booking response.'},
+            {'action': 'update_context', 'planning_state': 'waiting', 'waiting_reason': 'Need school booking details.'},
+        ])
+        self.assertEqual(self.apply(response).status_code, 200)
+        self.plan.refresh_from_db()
+        self.question.refresh_from_db()
+        self.assertEqual(self.plan.planning_state, 'waiting')
+        self.assertEqual(self.question.status, 'deferred')
+        self.assertEqual(self.question.answer, '')
+
+    def test_required_questions_prevent_actionable_state_and_roll_back(self):
+        response, _, _ = self.chat('Can we proceed?', [{'action': 'update_context', 'planning_state': 'actionable'}])
+        self.assertEqual(self.apply(response).status_code, 400)
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.version, 1)
+        self.assertEqual(self.plan.planning_state, 'clarifying')
+
+    def test_goal_less_revision_restores_context_and_questions(self):
+        url = f'/api/plans/{self.plan.pk}/questions/{self.question.pk}/answer/'
+        self.client.post(url, {'answer': 'No school yet.', 'plan_version': 1}, format='json')
+        response = self.client.post(f'/api/plans/{self.plan.pk}/revisions/1/restore/')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['context']['starting_point'], '')
+        self.assertEqual(response.data['questions'][0]['status'], 'open')
+        self.assertEqual(response.data['goals'], [])
+        self.assertEqual(response.data['version'], 3)
+
+    def test_durable_context_in_prompt_outlives_recent_messages(self):
+        import json
+
+        self.client.patch(f'/api/plans/{self.plan.pk}/context/', {
+            'plan_version': 1, 'constraints': ['Only evenings'],
+        }, format='json')
+        for index in range(15):
+            Message.objects.create(conversation=self.plan.conversation, role='assistant', content=f'Later discussion {index}')
+        response, gateway, _ = self.chat('What do you remember?', [])
+        self.assertEqual(response.status_code, 201)
+        prompt = json.loads(gateway.generate_json.call_args.kwargs['prompt'])
+        self.assertEqual(prompt['persistent_plan']['context']['constraints'], ['Only evenings'])
+        self.assertLessEqual(len(prompt['recent_messages']), 10)
+        self.assertNotIn('Only evenings', str(prompt['recent_messages']))
+
+    def test_idempotent_message_replay_and_content_conflict(self):
+        import uuid
+
+        response, _, data = self.chat('I have no school yet.', [], client_id=uuid.uuid4(), version=1)
+        self.assertEqual(response.status_code, 201)
+        count = self.plan.conversation.messages.count()
+        self.client.patch(f'/api/plans/{self.plan.pk}/context/', {'plan_version': 1, 'timing': 'Later'}, format='json')
+        with patch('conversations.clarification.get_ai_gateway', side_effect=AssertionError('Must not repeat AI')):
+            replay = self.client.post(self.chat_url, data, format='json')
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(self.plan.conversation.messages.count(), count + 1)
+        response = self.client.post(self.chat_url, {**data, 'content': 'Different content'}, format='json')
+        self.assertEqual(response.status_code, 409)
+
+    def test_model_failure_retry_keeps_ambition_and_user_message(self):
+        import uuid
+
+        data = {'content': 'No school yet.', 'client_id': str(uuid.uuid4())}
+        with patch('conversations.clarification.get_ai_gateway', side_effect=AIConfigurationError('Unavailable')):
+            self.assertEqual(self.client.post(self.chat_url, data, format='json').status_code, 503)
+        count = self.plan.conversation.messages.count()
+        response, _, _ = self.chat(data['content'], [], client_id=data['client_id'])
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(self.plan.conversation.messages.count(), count + 1)
+        self.assertTrue(Plan.objects.filter(pk=self.plan.pk).exists())
+
+    def test_old_state_and_cross_plan_evidence_cannot_be_applied(self):
+        response, _, _ = self.chat('I have not started.', lambda source: [
+            {'action': 'update_context', 'starting_point': 'I have not started.', 'source_message_id': source},
+        ])
+        self.client.patch(f'/api/plans/{self.plan.pk}/context/', {'plan_version': 1, 'timing': 'Later'}, format='json')
+        self.assertEqual(self.apply(response).status_code, 409)
+        from goals.planning import normalize_context_operation
+        from rest_framework.exceptions import ValidationError
+
+        other_plan = Plan.objects.create(user=self.user, title='Other', raw_input='Other')
+        other_chat = Conversation.objects.create(plan=other_plan, user=self.user)
+        source = Message.objects.create(conversation=other_chat, role='user', content='I have not started.')
+        self.plan.refresh_from_db()
+        with self.assertRaises(ValidationError):
+            normalize_context_operation(self.plan, {'action': 'update_context', 'starting_point': source.content,
+                                                   'source_message_id': str(source.pk)})
+
+    def test_no_tasks_or_excess_questions_can_be_generated_in_stage_one(self):
+        for changes in ([{'action': 'add_goal', 'title': 'Invented work'}],
+                        [{'action': 'ask_question', 'field': 'other', 'text': str(n)} for n in range(3)]):
+            response, _, _ = self.chat('Tell me more.', changes)
+            self.assertEqual(response.status_code, 502)
+        self.assertFalse(self.plan.goals.exists())
+
+    def test_ownership_and_authentication(self):
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.post('/api/plans/', {'text': 'Ambition'}, format='json').status_code, 401)
+        self.client.force_authenticate(User.objects.create_user(email='outsider-context@example.com'))
+        self.assertEqual(self.client.get(f'/api/plans/{self.plan.pk}/').status_code, 404)
+        self.assertEqual(self.client.patch(f'/api/plans/{self.plan.pk}/context/', {'plan_version': 1, 'timing': 'Later'}, format='json').status_code, 404)
+        self.assertEqual(self.client.post(f'/api/plans/{self.plan.pk}/questions/{self.question.pk}/answer/', {
+            'plan_version': 1, 'answer': 'Different answer',
+        }, format='json').status_code, 404)
+        self.assertEqual(self.client.post(self.chat_url, {'content': 'Read private context'}, format='json').status_code, 404)
