@@ -4,10 +4,11 @@ from django.core.exceptions import ValidationError
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils import timezone
+from rest_framework.exceptions import ValidationError as ApiValidationError
 
 from tasks.models import Task
 
-from .models import Goal, Plan, PlanChange, PlanRevision
+from .models import Goal, Plan, PlanChange, PlanRevision, PlanQuestion
 
 
 class InvalidPlanOperation(ValueError):
@@ -50,6 +51,17 @@ def serialize_plan_snapshot(plan):
         "raw_input": plan.raw_input,
         "status": plan.status,
         "version": plan.version,
+        "planning_mode": plan.planning_mode,
+        "planning_state": plan.planning_state,
+        "context": plan.context,
+        "context_provenance": plan.context_provenance,
+        "waiting_reason": plan.waiting_reason,
+        "questions": [
+            {"id": str(q.pk), "text": q.text, "field": q.field, "required": q.required,
+             "status": q.status, "answer": q.answer, "deferred_reason": q.deferred_reason,
+             "source_message_id": str(q.source_message_id) if q.source_message_id else None}
+            for q in plan.questions.all()
+        ],
         "goals": goals,
     }
 
@@ -119,6 +131,7 @@ def _task_payload(payload, *, goal_due_date=None):
 
 
 def normalize_plan_operations(plan, operations):
+    from .planning import CONTEXT_ACTIONS, normalize_context_operation
     if not isinstance(operations, list) or len(operations) > 25:
         raise InvalidPlanOperation("Changes must contain no more than 25 operations")
 
@@ -137,6 +150,14 @@ def normalize_plan_operations(plan, operations):
             raise InvalidPlanOperation("Each change must be an object")
 
         action = operation.get("action")
+        if action in CONTEXT_ACTIONS:
+            try:
+                normalized.append(normalize_context_operation(plan, operation))
+            except ApiValidationError as exc:
+                raise InvalidPlanOperation(str(exc.detail)) from exc
+            continue
+        if plan.planning_mode == "contextual":
+            raise InvalidPlanOperation("This clarification stage accepts context and question changes only.")
         if action not in supported_actions:
             raise InvalidPlanOperation("Unsupported board operation")
 
@@ -244,6 +265,7 @@ def create_plan_change(plan, scope_goal, summary, operations):
 
 
 def apply_plan_change(change, user):
+    from .planning import CONTEXT_ACTIONS, apply_context_operation, validate_planning_state
     with transaction.atomic():
         get_user_model().objects.select_for_update().get(pk=user.pk)
         change = (
@@ -263,6 +285,13 @@ def apply_plan_change(change, user):
         operations = normalize_plan_operations(plan, change.operations)
         for operation in operations:
             action = operation["action"]
+
+            if action in CONTEXT_ACTIONS:
+                try:
+                    apply_context_operation(plan, operation)
+                except ApiValidationError as exc:
+                    raise InvalidPlanOperation(str(exc.detail)) from exc
+                continue
 
             if action == "add_goal":
                 goal = Goal.objects.create(
@@ -311,6 +340,11 @@ def apply_plan_change(change, user):
             elif action == "delete_task":
                 _task_for_plan(plan, operation["task_id"]).delete()
 
+        if plan.planning_mode == "contextual":
+            try:
+                validate_planning_state(plan)
+            except ApiValidationError as exc:
+                raise InvalidPlanOperation(str(exc.detail)) from exc
         plan.version += 1
         plan.save(update_fields=["version", "updated_at"])
         change.status = PlanChange.Status.APPLIED
@@ -341,7 +375,7 @@ def restore_plan_revision(revision, user):
         )
         snapshot = revision.snapshot
         snapshot_goals = snapshot.get("goals", [])
-        if not snapshot_goals:
+        if not snapshot_goals and snapshot.get("planning_mode", "legacy") != "contextual":
             raise InvalidPlanOperation("Revision contains no goals")
 
         goal_ids = [goal["id"] for goal in snapshot_goals]
@@ -385,9 +419,31 @@ def restore_plan_revision(revision, user):
         plan.title = snapshot.get("title", plan.title)
         plan.raw_input = snapshot.get("raw_input", plan.raw_input)
         plan.status = snapshot.get("status", plan.status)
+        plan.planning_mode = snapshot.get("planning_mode", "legacy")
+        plan.planning_state = snapshot.get("planning_state", "actionable")
+        plan.context = snapshot.get("context", {})
+        plan.context_provenance = snapshot.get("context_provenance", {})
+        plan.waiting_reason = snapshot.get("waiting_reason", "")
+        questions = snapshot.get("questions", [])
+        plan.questions.exclude(pk__in=[q["id"] for q in questions]).delete()
+        for question in questions:
+            if PlanQuestion.objects.filter(pk=question["id"]).exclude(plan=plan).exists():
+                raise InvalidPlanOperation("Revision question belongs to another plan")
+            source_id = question.get("source_message_id")
+            if source_id:
+                from conversations.models import Message
+
+                if not Message.objects.filter(pk=source_id, conversation__plan=plan, role="user").exists():
+                    raise InvalidPlanOperation("Revision question has invalid evidence")
+            PlanQuestion.objects.update_or_create(pk=question["id"], defaults={
+                "plan": plan, **{key: question[key] for key in
+                                 ("text", "field", "required", "status", "answer", "deferred_reason")},
+                "source_message_id": source_id,
+            })
         plan.version += 1
         plan.save(
-            update_fields=["title", "raw_input", "status", "version", "updated_at"]
+            update_fields=["title", "raw_input", "status", "version", "updated_at",
+                           "planning_mode", "planning_state", "context", "context_provenance", "waiting_reason"]
         )
         create_plan_revision(plan, f"Restored version {revision.version}")
         return plan
