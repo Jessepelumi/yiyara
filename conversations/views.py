@@ -48,14 +48,6 @@ class PlanMessagesView(APIView):
         data = serializer.validated_data
 
         requested_version = data.get("plan_version")
-        if requested_version and requested_version != plan.version:
-            return Response(
-                {
-                    "error": "plan_version_conflict",
-                    "message": "Board changed. Refresh before sending another message.",
-                },
-                status=status.HTTP_409_CONFLICT,
-            )
 
         scope_goal = None
         scope_goal_id = data.get("scope_goal_id")
@@ -75,6 +67,8 @@ class PlanMessagesView(APIView):
                 role=Message.Role.USER,
             ).first()
             if existing:
+                if existing.content != data["content"]:
+                    return Response({"error": "client_id_conflict", "message": "This client_id belongs to different content."}, status=409)
                 assistant = conversation.messages.filter(
                     role=Message.Role.ASSISTANT,
                     metadata__request_client_id=str(client_id),
@@ -94,6 +88,12 @@ class PlanMessagesView(APIView):
                             "change": None,
                         }
                     )
+
+        if requested_version and requested_version != plan.version:
+            return Response(
+                {"error": "plan_version_conflict", "message": "Board changed. Refresh before sending another message."},
+                status=status.HTTP_409_CONFLICT,
+            )
 
         try:
             user_message, assistant_message, change = handle_plan_message(
@@ -124,6 +124,8 @@ class PlanMessagesView(APIView):
                 {"error": "plan_iteration_failed", "message": str(exc)},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
+        except PlanVersionConflict as exc:
+            return Response({"error": "plan_version_conflict", "message": str(exc)}, status=409)
 
 
 class ApplyPlanChangeView(APIView):
