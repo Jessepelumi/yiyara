@@ -1,4 +1,5 @@
 from django.urls import path
+from .planning_views import PlanContextView, QuestionAnswerView
 from .views import (
     DecomposeGoalView,
     DeleteGoalView,
@@ -23,6 +24,8 @@ urlpatterns = [
         name="import-preview-plan",
     ),
     path('plans/<uuid:plan_id>/', PlanDetailView.as_view(), name="plan-detail"),
+    path('plans/<uuid:plan_id>/context/', PlanContextView.as_view(), name="plan-context"),
+    path('plans/<uuid:plan_id>/questions/<uuid:question_id>/answer/', QuestionAnswerView.as_view(), name="question-answer"),
     path(
         'plans/<uuid:plan_id>/changes/',
         PlanChangeListView.as_view(),
