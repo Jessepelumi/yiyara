@@ -26,6 +26,16 @@ class Plan(models.Model):
         db_index=True,
     )
     version = models.PositiveIntegerField(default=1)
+    planning_mode = models.CharField(max_length=12, default="legacy", choices=[
+        ("legacy", "Legacy decomposition"), ("contextual", "Context-aware planning"),
+    ])
+    planning_state = models.CharField(max_length=12, default="actionable", choices=[
+        ("clarifying", "Clarifying"), ("actionable", "Actionable"),
+        ("waiting", "Waiting"), ("completed", "Completed"),
+    ])
+    context = models.JSONField(default=dict, blank=True)
+    context_provenance = models.JSONField(default=dict, blank=True)
+    waiting_reason = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -146,3 +156,24 @@ class PlanChange(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+
+
+class PlanQuestion(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    plan = models.ForeignKey(Plan, on_delete=models.CASCADE, related_name="questions")
+    text = models.CharField(max_length=2000)
+    field = models.CharField(max_length=20, choices=[
+        ("desired_outcome", "Desired outcome"), ("starting_point", "Starting point"),
+        ("timing", "Timing"), ("constraints", "Constraints"), ("other", "Other"),
+    ])
+    required = models.BooleanField(default=True)
+    status = models.CharField(max_length=10, default="open", choices=[
+        ("open", "Open"), ("answered", "Answered"), ("deferred", "Deferred"),
+    ])
+    answer = models.TextField(blank=True)
+    deferred_reason = models.CharField(max_length=2000, blank=True)
+    source_message = models.ForeignKey("conversations.Message", null=True, blank=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
