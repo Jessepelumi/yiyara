@@ -26,6 +26,7 @@ class Plan(models.Model):
         db_index=True,
     )
     version = models.PositiveIntegerField(default=1)
+    context_version = models.PositiveIntegerField(default=1)
     planning_mode = models.CharField(max_length=12, default="legacy", choices=[
         ("legacy", "Legacy decomposition"), ("contextual", "Context-aware planning"),
     ])
