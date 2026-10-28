@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.core.exceptions import ObjectDoesNotExist
-from .models import Goal, Plan, PlanChange, PlanRevision
+from .models import Goal, Plan, PlanChange, PlanRevision, PlanQuestion
 from tasks.serializers import TaskSerializers
 
 
@@ -49,9 +49,22 @@ class GoalSerializer(serializers.ModelSerializer):
         ]
 
 
+class PlanQuestionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PlanQuestion
+        fields = ["id", "text", "field", "required", "status", "answer", "deferred_reason", "source_message_id"]
+        read_only_fields = fields
+
+
+class AmbitionSerializer(serializers.Serializer):
+    text = serializers.CharField(max_length=10000)
+    title = serializers.CharField(max_length=255, required=False)
+
+
 class PlanSerializer(serializers.ModelSerializer):
     goals = GoalSerializer(many=True, read_only=True)
     conversation_id = serializers.SerializerMethodField()
+    questions = PlanQuestionSerializer(many=True, read_only=True)
 
     class Meta:
         model = Plan
@@ -65,6 +78,7 @@ class PlanSerializer(serializers.ModelSerializer):
             "goals",
             "created_at",
             "updated_at",
+            "planning_mode", "planning_state", "context", "context_provenance", "waiting_reason", "questions",
         ]
 
     def get_conversation_id(self, obj):
@@ -91,6 +105,7 @@ class PlanSummarySerializer(serializers.ModelSerializer):
             "first_goal_id",
             "created_at",
             "updated_at",
+            "planning_mode", "planning_state",
         ]
 
     def get_first_goal_id(self, obj):
