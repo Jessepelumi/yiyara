@@ -74,6 +74,7 @@ class PlanSerializer(serializers.ModelSerializer):
             "raw_input",
             "status",
             "version",
+            "context_version",
             "conversation_id",
             "goals",
             "created_at",
