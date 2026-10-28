@@ -16,6 +16,7 @@ from .serializers import (
     PlanSerializer,
     PlanSummarySerializer,
     PreviewPlanSerializer,
+    AmbitionSerializer,
 )
 from .models import Goal, Plan, PlanChange, PlanRevision
 from .services import (
@@ -194,6 +195,15 @@ class PlanListView(ListAPIView):
     serializer_class = PlanSummarySerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    def post(self, request):
+        from .planning import create_ambition
+
+        serializer = AmbitionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        plan = create_ambition(request.user, serializer.validated_data["text"],
+                               serializer.validated_data.get("title"))
+        return Response(PlanSerializer(plan).data, status=status.HTTP_201_CREATED)
+
     def get_queryset(self):
         return (
             Plan.objects.filter(user=self.request.user)
@@ -214,7 +224,7 @@ class PlanDetailView(RetrieveAPIView):
     def get_queryset(self):
         return (
             Plan.objects.filter(user=self.request.user)
-            .prefetch_related("goals__tasks")
+            .prefetch_related("goals__tasks", "questions")
             .select_related("conversation")
         )
 
