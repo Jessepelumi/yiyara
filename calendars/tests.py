@@ -711,3 +711,37 @@ class TaskSessionTests(APITestCase):
         session.refresh_from_db()
         self.assertEqual(session.status, 'proposed')
         self.assertEqual(self.client.post(f'/api/sessions/{session.pk}/reject/').status_code, 200)
+
+    def test_dependency_completion_is_rechecked_before_calendar_write(self):
+        from goals.models import Plan
+        from tasks.models import Task, TaskDependency
+
+        parent = Task.objects.create(goal=self.goal, title='Read first', is_completed=True)
+        TaskDependency.objects.create(task=self.task, prerequisite=parent)
+        session = self.session()
+        parent.is_completed = False
+        parent.save()
+        with patch('calendars.sessions.event_request') as event:
+            response = self.approve(session)
+        self.assertEqual(response.status_code, 400, response.data)
+        event.assert_not_called()
+        self.assertEqual(self.propose().status_code, 400)
+        parent.is_completed = True
+        parent.save()
+        self.task.planning_context_version = self.plan.context_version
+        self.task.save()
+        # A context correction must block both a new slot and approval of the old slot.
+        Plan.objects.filter(pk=self.plan.pk).update(context_version=self.plan.context_version + 1)
+        self.assertEqual(self.propose().status_code, 400)
+        with patch('calendars.sessions.event_request') as event:
+            self.assertEqual(self.approve(session).status_code, 400)
+        event.assert_not_called()
+
+    def test_old_session_snapshot_remains_compatible_without_dependencies(self):
+        session = self.session()
+        for field in ('dependencies', 'blocker_reason', 'planning_context_version'):
+            session.task_snapshot.pop(field)
+        session.save()
+        with patch('calendars.sessions.event_request', side_effect=lambda user, current, method, payload=None: (201, payload)):
+            response = self.approve(session)
+        self.assertEqual(response.status_code, 200, response.data)
