@@ -6,7 +6,7 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError as ApiValidationError
 
-from tasks.models import Task
+from tasks.models import Task, TaskDependency
 
 from .models import Goal, Plan, PlanChange, PlanRevision, PlanQuestion
 
@@ -39,6 +39,9 @@ def serialize_plan_snapshot(plan):
                         "estimated_minutes": task.estimated_minutes,
                         "completion_criteria": task.completion_criteria,
                         "readiness": task.readiness,
+                        "blocker_reason": task.blocker_reason,
+                        "planning_context_version": task.planning_context_version,
+                        "dependencies": sorted(str(pk) for pk in task.dependencies.values_list('pk', flat=True)),
                     }
                     for task in goal.tasks.all().order_by("created_at")
                 ],
@@ -51,6 +54,7 @@ def serialize_plan_snapshot(plan):
         "raw_input": plan.raw_input,
         "status": plan.status,
         "version": plan.version,
+        "context_version": plan.context_version,
         "planning_mode": plan.planning_mode,
         "planning_state": plan.planning_state,
         "context": plan.context,
@@ -136,6 +140,8 @@ def normalize_plan_operations(plan, operations):
         raise InvalidPlanOperation("Changes must contain no more than 25 operations")
 
     normalized = []
+    if any(isinstance(op, dict) and op.get('action') == 'add_task_batch' for op in operations) and len(operations) != 1:
+        raise InvalidPlanOperation('Task batches must be reviewed separately from context changes.')
     supported_actions = {
         "add_goal",
         "update_goal",
@@ -150,6 +156,13 @@ def normalize_plan_operations(plan, operations):
             raise InvalidPlanOperation("Each change must be an object")
 
         action = operation.get("action")
+        if action == 'add_task_batch':
+            from .task_planning import normalize_batch
+            try:
+                normalized.append(normalize_batch(plan, operation))
+            except ApiValidationError as exc:
+                raise InvalidPlanOperation(str(exc.detail)) from exc
+            continue
         if action in CONTEXT_ACTIONS:
             try:
                 normalized.append(normalize_context_operation(plan, operation))
@@ -213,9 +226,15 @@ def normalize_plan_operations(plan, operations):
 
             elif action == "add_task":
                 clean.update(_task_payload(operation, goal_due_date=goal.due_date))
+            elif action == 'delete_goal' and TaskDependency.objects.filter(
+                prerequisite__goal=goal
+            ).exclude(task__goal=goal).exists():
+                raise InvalidPlanOperation('Other tasks depend on this goal; update their prerequisites before deleting it.')
 
         else:
             task = _task_for_plan(plan, operation.get("task_id"))
+            if action == 'delete_task' and task.dependents.exists():
+                raise InvalidPlanOperation('Other tasks depend on this task; update their prerequisites before deleting it.')
             clean["task_id"] = str(task.id)
 
             if action == "update_task":
@@ -285,6 +304,13 @@ def apply_plan_change(change, user):
         operations = normalize_plan_operations(plan, change.operations)
         for operation in operations:
             action = operation["action"]
+            if action == 'add_task_batch':
+                from .task_planning import apply_batch
+                try:
+                    apply_batch(plan, operation)
+                except ApiValidationError as exc:
+                    raise InvalidPlanOperation(str(exc.detail)) from exc
+                continue
 
             if action in CONTEXT_ACTIONS:
                 try:
@@ -346,7 +372,9 @@ def apply_plan_change(change, user):
             except ApiValidationError as exc:
                 raise InvalidPlanOperation(str(exc.detail)) from exc
         plan.version += 1
-        plan.save(update_fields=["version", "updated_at"])
+        if any(op['action'] in CONTEXT_ACTIONS for op in operations):
+            plan.context_version += 1
+        plan.save(update_fields=["version", "context_version", "updated_at"])
         change.status = PlanChange.Status.APPLIED
         change.applied_at = timezone.now()
         change.save(update_fields=["status", "applied_at", "updated_at"])
@@ -379,6 +407,9 @@ def restore_plan_revision(revision, user):
             raise InvalidPlanOperation("Revision contains no goals")
 
         goal_ids = [goal["id"] for goal in snapshot_goals]
+        # Rebuild edges only after every restored task exists; rollback restores
+        # the previous graph if a snapshot is invalid.
+        TaskDependency.objects.filter(task__goal__plan=plan).delete()
         plan.goals.exclude(id__in=goal_ids).delete()
 
         for goal_data in snapshot_goals:
@@ -413,8 +444,19 @@ def restore_plan_revision(revision, user):
                         "estimated_minutes": item.get("estimated_minutes"),
                         "completion_criteria": item.get("completion_criteria", ""),
                         "readiness": item.get("readiness", "draft"),
+                        "blocker_reason": item.get("blocker_reason", ""),
+                        "planning_context_version": item.get("planning_context_version"),
                     },
                 )
+
+        from tasks.dependencies import replace_dependencies
+        try:
+            for goal_data in snapshot_goals:
+                for item in goal_data.get('tasks', []):
+                    task = Task.objects.select_related('goal__plan').get(pk=item['id'])
+                    replace_dependencies(task, item.get('dependencies', []))
+        except ApiValidationError as exc:
+            raise InvalidPlanOperation('Revision contains invalid task dependencies.') from exc
 
         plan.title = snapshot.get("title", plan.title)
         plan.raw_input = snapshot.get("raw_input", plan.raw_input)
@@ -441,9 +483,10 @@ def restore_plan_revision(revision, user):
                 "source_message_id": source_id,
             })
         plan.version += 1
+        plan.context_version += 1
         plan.save(
             update_fields=["title", "raw_input", "status", "version", "updated_at",
-                           "planning_mode", "planning_state", "context", "context_provenance", "waiting_reason"]
+                           "planning_mode", "planning_state", "context", "context_provenance", "waiting_reason", "context_version"]
         )
         create_plan_revision(plan, f"Restored version {revision.version}")
         return plan
