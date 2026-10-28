@@ -6,6 +6,7 @@ from django.shortcuts import get_object_or_404
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.throttling import ScopedRateThrottle
 
 from .models import Plan, PlanQuestion
 from .planning import (
@@ -44,7 +45,8 @@ class PlanContextView(APIView):
             apply_context_update(plan, fields, source)
             validate_planning_state(plan)
             plan.version += 1
-            plan.save(update_fields=['version', 'updated_at'])
+            plan.context_version += 1
+            plan.save(update_fields=['version', 'context_version', 'updated_at'])
             create_plan_revision(plan, 'User corrected planning context')
         return Response(PlanSerializer(plan).data)
 
@@ -73,6 +75,34 @@ class QuestionAnswerView(APIView):
             plan.planning_state = 'clarifying'
             plan.waiting_reason = ''
             plan.version += 1
-            plan.save(update_fields=['planning_state', 'waiting_reason', 'version', 'updated_at'])
+            plan.context_version += 1
+            plan.save(update_fields=['planning_state', 'waiting_reason', 'version', 'context_version', 'updated_at'])
             create_plan_revision(plan, 'User answered a clarification question')
         return Response(PlanSerializer(plan).data)
+
+
+class TaskPlanProposalView(APIView):
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'task_planning'
+
+    def post(self, request, plan_id):
+        from ai.providers.base import AIConfigurationError
+        from .services import PlanVersionConflict
+        from .serializers import PlanChangeSerializer
+        from .task_planning import TaskPlanningError, TaskPlanningRequestSerializer, propose_tasks
+
+        serializer = TaskPlanningRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            assistant, change, replayed = propose_tasks(request.user, plan_id, serializer.validated_data)
+            return Response({
+                'reply': assistant.content, 'message_id': assistant.pk,
+                'change': PlanChangeSerializer(change).data if change else None,
+                'replayed': replayed,
+            }, status=200 if replayed else 201)
+        except PlanVersionConflict as exc:
+            return Response({'error': 'plan_version_conflict', 'message': str(exc)}, status=409)
+        except AIConfigurationError:
+            return Response({'error': 'ai_not_configured', 'message': 'Task planning AI is not configured.'}, status=503)
+        except TaskPlanningError as exc:
+            return Response({'error': 'task_planning_failed', 'message': str(exc)}, status=502)
