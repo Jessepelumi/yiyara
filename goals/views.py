@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from django.shortcuts import get_object_or_404
 from django.db import transaction
+from django.db.models.deletion import RestrictedError
 from django.db.models import Count
 from rest_framework import status, permissions
 from workflow import ai_engine
@@ -183,6 +184,11 @@ class DeleteGoalView(APIView):
                 plan.save(update_fields=["version", "updated_at"])
                 create_plan_revision(plan, f'Deleted goal "{title}"')
             return Response(status=status.HTTP_204_NO_CONTENT)
+        except RestrictedError:
+            return Response(
+                {'error': 'task_dependencies', 'message': 'Other tasks depend on this goal. Update their prerequisites first.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         except Exception:
             logger.exception("Error deleting goal %s", pk)
             return Response(
