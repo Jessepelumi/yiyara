@@ -640,3 +640,232 @@ class ContextualPlanningTests(TestCase):
             'plan_version': 1, 'answer': 'Different answer',
         }, format='json').status_code, 404)
         self.assertEqual(self.client.post(self.chat_url, {'content': 'Read private context'}, format='json').status_code, 404)
+
+
+class ActionableTaskPlanningTests(TestCase):
+    def setUp(self):
+        import uuid
+        from django.core.cache import cache
+
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.user = User.objects.create_user(email='planner@example.com')
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        response = self.client.post('/api/plans/', {'text': 'Learn DSA'}, format='json')
+        self.plan = Plan.objects.get(pk=response.data['id'])
+        question = self.plan.questions.get()
+        response = self.client.post(f'/api/plans/{self.plan.pk}/questions/{question.pk}/answer/', {
+            'plan_version': self.plan.version, 'answer': 'I know Python but have never studied arrays.'}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.plan.refresh_from_db()
+        self.url = f'/api/plans/{self.plan.pk}/tasks/propose/'
+        self.request = {'plan_version': self.plan.version, 'client_id': str(uuid.uuid4())}
+        self.payload = {'reply': 'Review these two sessions.', 'summary': 'Begin arrays', 'goals': [{
+            'title': 'Understand arrays', 'description': 'Practise indexing and traversal.', 'tasks': [
+                {'key': 'read', 'title': 'Trace array indexing in Python', 'description': 'Create a five-element list; print its first and last elements.',
+                 'completion_criteria': 'A script prints both values and includes a note explaining zero-based indexing.',
+                 'estimated_minutes': 30, 'readiness': 'ready', 'blocker_reason': '', 'depends_on': []},
+                {'key': 'practise', 'title': 'Write a list traversal loop', 'description': 'Use the list from the previous session to print every item.',
+                 'completion_criteria': 'A loop prints all five items in order.',
+                 'estimated_minutes': 30, 'readiness': 'ready', 'blocker_reason': '', 'depends_on': ['read']},
+            ]}]}
+
+    def propose(self, payload=None, data=None):
+        with patch('goals.task_planning.get_ai_gateway', return_value=StubGateway(payload if payload is not None else self.payload)) as gateway:
+            response = self.client.post(self.url, data or self.request, format='json')
+        return response, gateway
+
+    def apply(self, response):
+        return self.client.post(f"/api/conversations/plans/{self.plan.pk}/changes/{response.data['change']['id']}/apply/")
+
+    def test_review_apply_dependencies_completion_and_replay(self):
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertFalse(Task.objects.exists())
+        self.assertFalse(self.plan.goals.exists())
+        applied = self.apply(response)
+        self.assertEqual(applied.status_code, 200, applied.data)
+        self.assertEqual(Task.objects.count(), 2)
+        first = Task.objects.get(title='Trace array indexing in Python')
+        second = Task.objects.get(title='Write a list traversal loop')
+        detail = self.client.get(f'/api/tasks/{second.pk}/').data
+        self.assertFalse(detail['is_schedulable'])
+        self.assertEqual([str(pk) for pk in detail['dependencies']], [str(first.pk)])
+        self.assertTrue(self.client.get(f'/api/tasks/{first.pk}/').data['is_schedulable'])
+        result = self.client.patch(f'/api/tasks/{first.pk}/', {'is_completed': True}, format='json')
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertTrue(self.client.get(f'/api/tasks/{second.pk}/').data['is_schedulable'])
+        replay, gateway = self.propose()
+        self.assertEqual(replay.status_code, 200, replay.data)
+        gateway.assert_not_called()
+        self.assertEqual(replay.data['change']['status'], 'applied')
+        self.assertEqual(Task.objects.count(), 2)
+
+    def test_context_change_requires_explicit_task_review(self):
+        response, _ = self.propose()
+        self.assertEqual(self.apply(response).status_code, 200)
+        self.plan.refresh_from_db()
+        original_context_version = self.plan.context_version
+        response = self.client.patch(f'/api/plans/{self.plan.pk}/context/', {
+            'plan_version': self.plan.version, 'constraints': ['Only twenty minutes available per day.']}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        task = Task.objects.get(title='Trace array indexing in Python')
+        self.assertFalse(self.client.get(f'/api/tasks/{task.pk}/').data['is_schedulable'])
+        response = self.client.patch(f'/api/tasks/{task.pk}/', {'readiness': 'ready', 'estimated_minutes': 20}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(response.data['is_schedulable'])
+        self.assertEqual(response.data['planning_context_version'], original_context_version + 1)
+
+    def test_invalid_graphs_dates_and_invented_resources_save_no_tasks(self):
+        import copy
+        import uuid
+
+        for mutation in ['cycle', 'self', 'unknown', 'foreign', 'date', 'url']:
+            payload = copy.deepcopy(self.payload)
+            tasks = payload['goals'][0]['tasks']
+            if mutation == 'cycle':
+                tasks[0]['depends_on'] = ['practise']
+            elif mutation == 'self':
+                tasks[0]['depends_on'] = ['read']
+            elif mutation == 'unknown':
+                tasks[0]['depends_on'] = ['missing']
+            elif mutation == 'foreign':
+                tasks[0]['depends_on'] = [str(uuid.uuid4())]
+            elif mutation == 'date':
+                tasks[0]['due_date'] = '2026-12-31'
+            else:
+                tasks[0]['description'] = 'Use https://invented.example/course'
+            with self.subTest(mutation=mutation):
+                response, _ = self.propose(payload, {**self.request, 'client_id': str(uuid.uuid4())})
+                self.assertEqual(response.status_code, 502, response.data)
+                self.assertFalse(self.plan.changes.exists())
+                self.assertFalse(Task.objects.exists())
+
+    def test_external_blocker_is_retained_and_prevents_scheduling(self):
+        self.payload['goals'][0]['tasks'] = [self.payload['goals'][0]['tasks'][0]]
+        task = self.payload['goals'][0]['tasks'][0]
+        task.update(readiness='blocked', estimated_minutes=None, blocker_reason='Awaiting course access.')
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        applied = self.apply(response)
+        self.assertEqual(applied.status_code, 200, applied.data)
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.planning_state, 'waiting')
+        detail = self.client.get(f'/api/tasks/{Task.objects.get().pk}/').data
+        self.assertFalse(detail['is_schedulable'])
+        self.assertEqual(detail['blocker_reason'], 'Awaiting course access.')
+
+    def test_missing_context_does_not_call_ai(self):
+        self.plan.context['starting_point'] = ''
+        self.plan.save()
+        response, gateway = self.propose()
+        self.assertEqual(response.status_code, 400, response.data)
+        gateway.assert_not_called()
+
+    def test_empty_result_and_failed_request_retries_are_idempotent(self):
+        response, _ = self.propose({'reply': 'Which course can you access?', 'summary': 'More context needed', 'goals': []})
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertIsNone(response.data['change'])
+        replay, gateway = self.propose()
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(replay.data['message_id'], response.data['message_id'])
+        gateway.assert_not_called()
+        self.assertFalse(Task.objects.exists())
+
+    def test_failed_request_can_retry_and_client_id_cannot_change_focus(self):
+        with patch('goals.task_planning.get_ai_gateway', return_value=StubGateway(error=RuntimeError('provider unavailable'))):
+            response = self.client.post(self.url, self.request, format='json')
+        self.assertEqual(response.status_code, 502, response.data)
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(Message.objects.filter(client_id=self.request['client_id']).count(), 1)
+        conflict, gateway = self.propose(data={**self.request, 'focus': 'Something different'})
+        self.assertEqual(conflict.status_code, 409)
+        gateway.assert_not_called()
+
+    def test_stale_proposal_cannot_be_applied(self):
+        response, _ = self.propose()
+        edit = self.client.patch(f'/api/plans/{self.plan.pk}/context/', {
+            'plan_version': self.plan.version, 'timing': 'Next month'}, format='json')
+        self.assertEqual(edit.status_code, 200, edit.data)
+        self.assertEqual(self.apply(response).status_code, 409)
+        self.assertFalse(Task.objects.exists())
+
+    def test_context_change_during_generation_discards_result(self):
+        def generate(**kwargs):
+            Plan.objects.filter(pk=self.plan.pk).update(version=self.plan.version + 1)
+            return self.payload
+        gateway = Mock()
+        gateway.generate_json.side_effect = generate
+        with patch('goals.task_planning.get_ai_gateway', return_value=gateway):
+            response = self.client.post(self.url, self.request, format='json')
+        self.assertEqual(response.status_code, 409, response.data)
+        self.assertFalse(self.plan.changes.exists())
+
+    def test_owner_only_and_authentication_required(self):
+        other = User.objects.create_user(email='another-planner@example.com')
+        self.client.force_authenticate(other)
+        self.assertEqual(self.client.post(self.url, self.request, format='json').status_code, 404)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.post(self.url, self.request, format='json').status_code, 401)
+
+    def test_restore_preserves_dependencies_and_requires_context_review(self):
+        response, _ = self.propose()
+        self.assertEqual(self.apply(response).status_code, 200)
+        self.plan.refresh_from_db()
+        saved_version = self.plan.version
+        first = Task.objects.get(title='Trace array indexing in Python')
+        second = Task.objects.get(title='Write a list traversal loop')
+        self.client.patch(f'/api/tasks/{second.pk}/', {'dependency_ids': []}, format='json')
+        response = self.client.post(f'/api/plans/{self.plan.pk}/revisions/{saved_version}/restore/')
+        self.assertEqual(response.status_code, 200, response.data)
+        second.refresh_from_db()
+        self.assertTrue(second.dependencies.filter(pk=first.pk).exists())
+        self.assertFalse(self.client.get(f'/api/tasks/{first.pk}/').data['is_schedulable'])
+
+    def test_followup_reuses_goal_and_rejects_duplicate_unfinished_work(self):
+        import uuid
+
+        response, _ = self.propose()
+        self.assertEqual(self.apply(response).status_code, 200)
+        self.plan.refresh_from_db()
+        goal = self.plan.goals.get()
+        self.payload['goals'][0]['goal_id'] = str(goal.pk)
+        duplicate, _ = self.propose(data={'plan_version': self.plan.version, 'client_id': str(uuid.uuid4())})
+        self.assertEqual(duplicate.status_code, 502, duplicate.data)
+        task = self.payload['goals'][0]['tasks'][0]
+        task.update(key='search', title='Implement linear search',
+                    completion_criteria='A function returns the index of an existing element and handles a missing element.',
+                    depends_on=[str(Task.objects.get(title='Write a list traversal loop').pk)])
+        self.payload['goals'][0]['tasks'] = [task]
+        response, _ = self.propose(data={'plan_version': self.plan.version, 'client_id': str(uuid.uuid4())})
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(self.apply(response).status_code, 200)
+        self.assertEqual(self.plan.goals.count(), 1)
+        self.assertEqual(goal.tasks.count(), 3)
+        self.assertTrue(Task.objects.get(title='Implement linear search').dependencies.exists())
+
+    def test_waiting_plan_can_propose_independent_work_without_erasing_wait_reason(self):
+        from goals.models import PlanQuestion
+
+        PlanQuestion.objects.create(plan=self.plan, text='When does the course begin?', field='timing',
+                                    required=True, status='deferred', deferred_reason='Waiting for the provider.')
+        self.plan.planning_state = 'waiting'
+        self.plan.waiting_reason = 'Waiting for the course timetable.'
+        self.plan.save()
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(self.apply(response).status_code, 200)
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.planning_state, 'waiting')
+        self.assertEqual(self.plan.waiting_reason, 'Waiting for the course timetable.')
+        task = Task.objects.get(title='Trace array indexing in Python')
+        self.assertTrue(self.client.get(f'/api/tasks/{task.pk}/').data['is_schedulable'])
+
+    def test_rejection_saves_no_tasks(self):
+        response, _ = self.propose()
+        response = self.client.post(f"/api/conversations/plans/{self.plan.pk}/changes/{response.data['change']['id']}/reject/")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertFalse(Task.objects.exists())
+        self.assertFalse(self.plan.goals.exists())
