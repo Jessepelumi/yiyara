@@ -82,6 +82,11 @@ def handle_plan_message(
     gateway=None,
     user_message=None,
 ):
+    if plan.planning_mode == "contextual":
+        from .clarification import handle_clarification
+
+        return handle_clarification(plan, conversation, raw_text, client_id=client_id,
+                                    gateway=gateway, user_message=user_message)
     gateway = gateway or get_ai_gateway()
     prompt = _build_iteration_prompt(plan, conversation, raw_text, scope_goal)
     if user_message is None:
