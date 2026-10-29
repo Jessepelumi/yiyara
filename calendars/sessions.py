@@ -26,12 +26,14 @@ def snapshot(task):
             "readiness": task.readiness, "due_date": str(task.due_date) if task.due_date else None,
             "goal_due_date": str(task.goal.due_date) if task.goal.due_date else None,
             "dependencies": sorted(str(pk) for pk in task.dependencies.values_list('pk', flat=True)),
-            "blocker_reason": task.blocker_reason, "planning_context_version": task.planning_context_version}
+            "blocker_reason": task.blocker_reason, "planning_context_version": task.planning_context_version,
+            "remaining_minutes": task.remaining_minutes, "progress_version": task.progress_version}
 
 
 def matches_snapshot(task, saved):
     # Previously created proposals predate dependency/context fields.
-    return snapshot(task) == {"dependencies": [], "blocker_reason": "", "planning_context_version": None, **saved}
+    return snapshot(task) == {"dependencies": [], "blocker_reason": "", "planning_context_version": None,
+                             "remaining_minutes": None, "progress_version": 0, **saved}
 
 
 def ready(task):
@@ -123,7 +125,7 @@ def propose(user, task_id, start, end):
         due = deadline(task, preferences)
         limit = min(end, due) if due else end
         start = max(start, timezone.now())
-        duration = timedelta(minutes=task.estimated_minutes)
+        duration = timedelta(minutes=task.effective_minutes)
         # A replacement proposal may reuse its own previous tentative reservation.
         previous = list(WorkSession.objects.filter(task=task, status='proposed').values_list('pk', flat=True))
         windows = permitted_windows(user, start, limit) if start < limit else []
