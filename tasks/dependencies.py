@@ -50,8 +50,10 @@ def scheduling_blockers(task):
     blockers = []
     if task.is_completed or task.goal.is_completed or task.goal.plan.status != 'active':
         blockers.append('Task or goal is complete, or its plan is inactive.')
-    if task.readiness != 'ready' or not task.completion_criteria.strip() or not task.estimated_minutes or not 5 <= task.estimated_minutes <= 480:
+    if task.readiness != 'ready' or not task.completion_criteria.strip() or not task.effective_minutes or not 5 <= task.effective_minutes <= 480:
         blockers.append('Task needs ready status, effort and completion criteria.')
+    if task.progress_status == 'skipped':
+        blockers.append('Task was skipped. Explicitly reopen it before scheduling.')
     if task.blocker_reason.strip():
         blockers.append(task.blocker_reason)
     if task.dependencies.filter(is_completed=False).exists():
