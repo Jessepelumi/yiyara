@@ -36,6 +36,9 @@ def serialize_plan_snapshot(plan):
                         "description": task.description,
                         "due_date": task.due_date.isoformat() if task.due_date else None,
                         "is_completed": task.is_completed,
+                        "progress_status": task.progress_status,
+                        "remaining_minutes": task.remaining_minutes,
+                        "progress_version": task.progress_version,
                         "estimated_minutes": task.estimated_minutes,
                         "completion_criteria": task.completion_criteria,
                         "readiness": task.readiness,
@@ -65,6 +68,12 @@ def serialize_plan_snapshot(plan):
              "status": q.status, "answer": q.answer, "deferred_reason": q.deferred_reason,
              "source_message_id": str(q.source_message_id) if q.source_message_id else None}
             for q in plan.questions.all()
+        ],
+        "recent_task_outcomes": [
+            {"id": str(item.pk), "task_id": str(item.task_id), "status": item.status, "notes": item.notes,
+             "remaining_minutes": item.remaining_minutes, "spent_minutes": item.spent_minutes,
+             "blocker_reason": item.blocker_reason, "created_at": item.created_at.isoformat()}
+            for item in plan.task_outcomes.all()[:50]
         ],
         "goals": goals,
     }
@@ -359,10 +368,13 @@ def apply_plan_change(change, user):
                 )
             elif action == "update_task":
                 task = _task_for_plan(plan, operation["task_id"])
-                for field in ("title", "description", "due_date", "is_completed"):
+                for field in ("title", "description", "due_date"):
                     if field in operation:
                         setattr(task, field, operation[field])
                 task.save()
+                if 'is_completed' in operation:
+                    from tasks.outcomes import record_completion_toggle
+                    record_completion_toggle(task, plan, operation['is_completed'])
             elif action == "delete_task":
                 _task_for_plan(plan, operation["task_id"]).delete()
 
@@ -441,6 +453,9 @@ def restore_plan_revision(revision, user):
                         "description": item.get("description", ""),
                         "due_date": item.get("due_date"),
                         "is_completed": item.get("is_completed", False),
+                        "progress_status": item.get("progress_status", 'completed' if item.get('is_completed') else 'not_started'),
+                        "remaining_minutes": item.get("remaining_minutes"),
+                        "progress_version": item.get("progress_version", 0),
                         "estimated_minutes": item.get("estimated_minutes"),
                         "completion_criteria": item.get("completion_criteria", ""),
                         "readiness": item.get("readiness", "draft"),
@@ -448,6 +463,10 @@ def restore_plan_revision(revision, user):
                         "planning_context_version": item.get("planning_context_version"),
                     },
                 )
+
+        from tasks.outcomes import preserve_reported_progress
+        for task in Task.objects.filter(goal__plan=plan):
+            preserve_reported_progress(task, plan)
 
         from tasks.dependencies import replace_dependencies
         try:
