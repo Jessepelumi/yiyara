@@ -32,7 +32,7 @@ class TaskPlanningRequestSerializer(serializers.Serializer):
 class StrictSerializer(serializers.Serializer):
     def to_internal_value(self, data):
         if not isinstance(data, dict) or set(data) - set(self.fields):
-            raise serializers.ValidationError('Unexpected fields in task plan.')
+            raise serializers.ValidationError({'non_field_errors': ['Unexpected fields in task plan.']})
         return super().to_internal_value(data)
 
 
@@ -79,7 +79,7 @@ def ensure_plannable(plan):
         raise serializers.ValidationError('Set a waiting reason for deferred required information first.')
 
 
-def normalize_batch(plan, operation):
+def normalize_batch(plan, operation, *, existing_graph=None, unfinished_signatures=None):
     ensure_plannable(plan)
     if operation.get('context_version') != plan.context_version:
         raise serializers.ValidationError('Planning context changed; request a new task proposal.')
@@ -88,12 +88,13 @@ def normalize_batch(plan, operation):
     goals = serializer.validated_data
     if sum(len(goal['tasks']) for goal in goals) > 10:
         raise serializers.ValidationError('Propose at most ten new tasks.')
-    graph = plan_graph(plan)
+    graph = plan_graph(plan) if existing_graph is None else {node: set(parents) for node, parents in existing_graph.items()}
     keys = [task['key'] for goal in goals for task in goal['tasks']]
     if len(keys) != len(set(keys)):
         raise serializers.ValidationError('Task keys must be unique across the proposal.')
     graph.update({'new:' + key: set() for key in keys})
-    duplicates = set(Task.objects.filter(goal__plan=plan, is_completed=False).values_list('title', 'completion_criteria'))
+    duplicates = (set(Task.objects.filter(goal__plan=plan, is_completed=False).values_list('title', 'completion_criteria'))
+                  if unfinished_signatures is None else set(unfinished_signatures))
     duplicates = {(title.casefold(), criteria.casefold()) for title, criteria in duplicates}
     existing_titles = set(plan.goals.values_list('title', flat=True))
     existing_titles = {title.casefold() for title in existing_titles}
@@ -122,6 +123,7 @@ def normalize_batch(plan, operation):
             if signature in duplicates:
                 raise serializers.ValidationError('This proposal duplicates unfinished work.')
             duplicates.add(signature)
+            canonical_refs = []
             for reference in task['depends_on']:
                 if reference in keys:
                     parent = 'new:' + reference
@@ -133,6 +135,10 @@ def normalize_batch(plan, operation):
                     if parent not in graph:
                         raise serializers.ValidationError('Prerequisites must belong to this plan.')
                 graph['new:' + task['key']].add(parent)
+                canonical_refs.append(parent[4:] if parent.startswith('new:') else parent)
+            if len(canonical_refs) != len(set(canonical_refs)):
+                raise serializers.ValidationError('Duplicate prerequisites are not allowed.')
+            task['depends_on'] = canonical_refs
             for field in ('title', 'description', 'completion_criteria'):
                 for url in re.findall(r'https?://[^\s<>"\)]+', task[field]):
                     if url.rstrip('.,;!') not in known_text:
@@ -161,6 +167,11 @@ def apply_batch(plan, operation):
                 TaskDependency(task=created[data['key']], prerequisite_id=(created[ref].pk if ref in created else ref))
                 for ref in data['depends_on']
             ])
+    update_planning_state(plan, created.values())
+    return created
+
+
+def update_planning_state(plan, affected):
     if plan.questions.filter(required=True).exclude(status='answered').exists():
         plan.planning_state = 'waiting'
         plan.waiting_reason = plan.waiting_reason or 'Required information is still pending; only independent work can proceed.'
@@ -169,7 +180,7 @@ def apply_batch(plan, operation):
 
         if not any(not scheduling_blockers(task) for task in Task.objects.filter(goal__plan=plan, is_completed=False)):
             plan.planning_state = 'waiting'
-            plan.waiting_reason = next((t.blocker_reason for t in created.values() if t.blocker_reason),
+            plan.waiting_reason = next((t.blocker_reason for t in affected if t.blocker_reason),
                                        'Complete prerequisites or clarify task details before scheduling.')
         else:
             plan.planning_state = 'actionable'
@@ -189,9 +200,18 @@ def validate_result(plan, payload):
     return {'reply': reply, 'summary': summary, 'goals': operation['goals'] if operation else []}
 
 
-def propose_tasks(user, plan_id, data):
+def propose_tasks(user, plan_id, data, *, replanning=False):
     from conversations.models import Conversation, Message
     from .services import PlanVersionConflict, create_plan_change, serialize_plan_snapshot
+
+    source = 'task_replanning' if replanning else 'task_planning'
+    validate_payload = validate_result
+    system_prompt, schema = TASK_PLANNING_SYSTEM_PROMPT, TASK_PLANNING_SCHEMA
+    if replanning:
+        from .replanning import validate_replan_result
+        from ai.prompts.replanning_prompt import REPLANNING_SCHEMA, REPLANNING_SYSTEM_PROMPT
+        validate_payload = validate_replan_result
+        system_prompt, schema = REPLANNING_SYSTEM_PROMPT, REPLANNING_SCHEMA
 
     with transaction.atomic():
         get_user_model().objects.select_for_update().get(pk=user.pk)
@@ -199,7 +219,7 @@ def propose_tasks(user, plan_id, data):
         conversation, _ = Conversation.objects.get_or_create(plan=plan, defaults={'user': user})
         existing = conversation.messages.filter(client_id=data['client_id'], role='user').first()
         if existing:
-            if existing.metadata.get('source') != 'task_planning' or existing.metadata.get('focus') != data['focus']:
+            if existing.metadata.get('source') != source or existing.metadata.get('focus') != data['focus']:
                 raise PlanVersionConflict('This client_id belongs to a different request.')
             assistant = conversation.messages.filter(role='assistant', metadata__request_client_id=str(data['client_id'])).first()
             if assistant:
@@ -211,13 +231,18 @@ def propose_tasks(user, plan_id, data):
             raise PlanVersionConflict('Plan changed. Refresh before requesting tasks.')
         ensure_plannable(plan)
         message = existing or Message.objects.create(
-            conversation=conversation, role='user', content=data['focus'] or 'Propose the next actionable tasks from saved context.',
+            conversation=conversation, role='user', content=data['focus'] or (
+                'Review unfinished tasks using saved context and reported progress.' if replanning
+                else 'Propose the next actionable tasks from saved context.'),
             client_id=data['client_id'],
         )
-        message.metadata = {'source': 'task_planning', 'focus': data['focus'], 'ai_status': 'pending'}
+        message.metadata = {'source': source, 'focus': data['focus'], 'ai_status': 'pending'}
         message.save(update_fields=['metadata'])
         captured_version = plan.version
         snapshot = serialize_plan_snapshot(plan)
+        if replanning:
+            from .replanning import protected_task_ids
+            snapshot['protected_task_ids'] = sorted(protected_task_ids(plan))
     try:
         from calendars.models import SchedulingPreferences
 
@@ -232,23 +257,26 @@ def propose_tasks(user, plan_id, data):
         }, ensure_ascii=False)
         gateway = get_ai_gateway()
         payload = gateway.generate_json(
-            task=AITask.TASK_PLANNING, prompt=prompt, system_prompt=TASK_PLANNING_SYSTEM_PROMPT,
-            response_schema=TASK_PLANNING_SCHEMA, schema_name='next_actionable_tasks', temperature=0.1,
+            task=AITask.TASK_PLANNING, prompt=prompt, system_prompt=system_prompt,
+            response_schema=schema, schema_name='task_replanning' if replanning else 'next_actionable_tasks', temperature=0.1,
             max_output_tokens=settings.AI_MAX_OUTPUT_TOKENS, timeout_seconds=settings.AI_REQUEST_TIMEOUT_SECONDS,
-            validator=lambda result: validate_result(plan, result),
+            validator=lambda result: validate_payload(plan, result),
         )
-        payload = validate_result(plan, payload)
+        payload = validate_payload(plan, payload)
         with transaction.atomic():
             get_user_model().objects.select_for_update().get(pk=user.pk)
             fresh = Plan.objects.select_for_update().get(pk=plan.pk)
             if fresh.version != captured_version:
                 raise PlanVersionConflict('Plan changed while tasks were being proposed. Retry with the current version.')
             ensure_plannable(fresh)
-            change = create_plan_change(fresh, None, payload['summary'], [{
-                'action': 'add_task_batch', 'context_version': fresh.context_version, 'goals': payload['goals'],
-            }] if payload['goals'] else [])
+            operation = {'action': 'replan_tasks' if replanning else 'add_task_batch',
+                         'context_version': fresh.context_version, 'goals': payload['goals']}
+            if replanning:
+                operation['updates'] = payload['updates']
+            change = create_plan_change(fresh, None, payload['summary'], [operation]
+                                        if payload['goals'] or payload.get('updates') else [])
             assistant = Message.objects.create(conversation=conversation, role='assistant', content=payload['reply'], metadata={
-                'source': 'task_planning', 'request_client_id': str(data['client_id']),
+                'source': source, 'request_client_id': str(data['client_id']),
                 'change_id': str(change.pk) if change else None,
             })
             message.metadata['ai_status'] = 'completed'
