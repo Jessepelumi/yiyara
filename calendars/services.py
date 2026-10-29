@@ -70,6 +70,8 @@ def configuration():
 def request_json(method, url, **kwargs):
     try:
         response = httpx.request(method, url, timeout=20, **kwargs)
+        if response.status_code == 204:
+            return 204, {}
         payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError()
