@@ -10,7 +10,7 @@ from calendars.models import WorkSession
 from goals.models import Goal, Plan
 from goals.services import create_plan_revision
 from .models import Task
-from .serializers import TaskWriteSerializer
+from .serializers import TaskWriteSerializer, TaskOutcomeSerializer
 
 
 class TaskCreateView(CalendarView):
@@ -46,8 +46,33 @@ class TaskDetailView(CalendarView):
                     raise ValidationError('Only completion may change after publishing starts; event editing is not supported yet.')
             serializer = TaskWriteSerializer(task, data=request.data, partial=True, context={'goal': task.goal})
             serializer.is_valid(raise_exception=True)
+            completed = serializer.validated_data.pop('is_completed', None)
             serializer.save()
+            if completed is not None:
+                from .outcomes import record_completion_toggle
+                record_completion_toggle(task, plan, completed)
             plan.version += 1
             plan.save(update_fields=['version', 'updated_at'])
             create_plan_revision(plan, 'Updated task details')
         return Response(serializer.data)
+
+
+class TaskOutcomeView(CalendarView):
+    def get(self, request, task_id):
+        from .models import TaskOutcome
+        # History also remains readable after a task is deleted by a revision restore.
+        task = Task.objects.filter(pk=task_id, goal__user=request.user).first()
+        history = TaskOutcome.objects.filter(task_id=task_id, plan__user=request.user)
+        if task is None and not history.exists():
+            from django.http import Http404
+            raise Http404
+        return Response(TaskOutcomeSerializer(history, many=True).data)
+
+    def post(self, request, task_id):
+        from .outcomes import OutcomeRequestSerializer, record_outcome
+
+        serializer = OutcomeRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        task, plan, outcome, replayed = record_outcome(request.user, task_id, serializer.validated_data)
+        return Response({'outcome': TaskOutcomeSerializer(outcome).data, 'task': TaskWriteSerializer(task).data,
+                         'plan_version': plan.version, 'replayed': replayed}, status=200 if replayed else 201)
