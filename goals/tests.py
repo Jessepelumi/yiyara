@@ -869,3 +869,351 @@ class ActionableTaskPlanningTests(TestCase):
         self.assertEqual(response.status_code, 200, response.data)
         self.assertFalse(Task.objects.exists())
         self.assertFalse(self.plan.goals.exists())
+
+
+class TaskReplanningTests(TestCase):
+    def setUp(self):
+        import uuid
+        from django.core.cache import cache
+        from goals.services import create_plan_revision
+
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.user = User.objects.create_user(email='replan@example.com')
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.plan = Plan.objects.create(user=self.user, title='Learn DSA', raw_input='Learn DSA',
+            planning_mode='contextual', planning_state='actionable', context={
+                'desired_outcome': 'Learn DSA', 'starting_point': 'I can write Python loops.',
+                'timing': '', 'constraints': [], 'assumptions': []})
+        self.goal = Goal.objects.create(user=self.user, plan=self.plan, title='Array practice')
+        self.task = Task.objects.create(goal=self.goal, title='Write array exercises', description='Write a list traversal loop.',
+            readiness='ready', estimated_minutes=60, completion_criteria='All examples print correctly.', planning_context_version=1)
+        self.prerequisite = Task.objects.create(goal=self.goal, title='Read traversal examples',
+            readiness='ready', estimated_minutes=15, completion_criteria='Notes saved.', planning_context_version=1)
+        create_plan_revision(self.plan, 'Initial tasks')
+        self.url = f'/api/plans/{self.plan.pk}/replan/'
+        self.request = {'client_id': str(uuid.uuid4()), 'plan_version': self.plan.version,
+                        'focus': 'I found recursion difficult. Adjust my remaining exercise and suggest practice.'}
+        self.payload = {'reply': 'Review this adjustment to your remaining exercise.', 'summary': 'Revise remaining practice',
+            'updates': [{'task_id': str(self.task.pk), 'reason': 'Focus the remaining session on tracing one loop before recursion.',
+                         'changes': {'description': 'Trace a loop over a three-element list on paper, then run it and compare the output.',
+                                     'completion_criteria': 'The paper trace matches all three printed values.', 'readiness': 'ready'}}],
+            'goals': []}
+
+    def propose(self, payload=None, data=None):
+        with patch('goals.task_planning.get_ai_gateway', return_value=StubGateway(payload if payload is not None else self.payload)) as gateway:
+            response = self.client.post(self.url, data or self.request, format='json')
+        return response, gateway
+
+    def apply(self, response):
+        return self.client.post(f"/api/conversations/plans/{self.plan.pk}/changes/{response.data['change']['id']}/apply/")
+
+    def report(self, **changes):
+        import uuid
+
+        self.plan.refresh_from_db()
+        result = self.client.post(f'/api/tasks/{self.task.pk}/outcomes/', {
+            'client_id': str(uuid.uuid4()), 'plan_version': self.plan.version,
+            'status': 'partial', 'remaining_minutes': 20, 'notes': 'I understand loops but recursion is difficult.', **changes}, format='json')
+        self.assertEqual(result.status_code, 201, result.data)
+        self.plan.refresh_from_db()
+        self.request['plan_version'] = self.plan.version
+        return result
+
+    def add_task(self, **changes):
+        data = {'key': 'recursion', 'title': 'Trace recursive countdown',
+                'description': 'Trace countdown(3) through calls 3, 2, 1 and the base case 0 on paper.',
+                'completion_criteria': 'The trace labels every call and the base case.',
+                'estimated_minutes': 20, 'readiness': 'ready', 'blocker_reason': '',
+                'depends_on': [str(self.task.pk)], **changes}
+        self.payload['goals'] = [{'goal_id': str(self.goal.pk), 'tasks': [data]}]
+
+    def session(self, status='proposed', task=None):
+        import uuid
+        from datetime import timedelta
+        from django.utils import timezone
+        from calendars.models import WorkSession
+        from calendars.sessions import snapshot
+
+        task = task or self.task
+        start = timezone.now() + timedelta(days=2)
+        return WorkSession.objects.create(user=self.user, task=task, status=status, starts_at=start,
+            ends_at=start + timedelta(hours=1), expires_at=start, destination_calendar='target',
+            google_sub='subject', google_event_id=uuid.uuid4().hex, task_snapshot=snapshot(task))
+
+    def test_review_then_apply_preserves_outcomes_and_invalidates_tentative_session(self):
+        from tasks.models import TaskOutcome
+
+        self.report()
+        session = self.session()
+        unaffected_session = self.session(task=self.prerequisite)
+        original = TaskOutcome.objects.get()
+        original_state = original.task_state.copy()
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        update = response.data['change']['operations'][0]['updates'][0]
+        self.assertEqual(update['before']['description'], self.task.description)
+        self.assertEqual(update['before']['remaining_minutes'], 20)
+        self.assertTrue(update['reason'])
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.description, 'Write a list traversal loop.')
+        self.assertEqual(self.apply(response).status_code, 200)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.description, self.payload['updates'][0]['changes']['description'])
+        self.assertEqual(self.task.remaining_minutes, 20)
+        self.assertEqual(self.task.estimated_minutes, 60)
+        self.assertEqual(self.task.progress_status, 'partial')
+        self.assertFalse(self.task.is_completed)
+        self.assertEqual(self.task.progress_version, 1)
+        self.assertEqual(TaskOutcome.objects.count(), 1)
+        original.refresh_from_db()
+        self.assertEqual(original.task_state, original_state)
+        session.refresh_from_db()
+        unaffected_session.refresh_from_db()
+        self.assertEqual(session.status, 'rejected')
+        self.assertEqual(unaffected_session.status, 'proposed')
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.context_version, 1)
+        self.assertEqual(self.plan.revisions.get(version=self.plan.version).snapshot['goals'][0]['tasks'][0]['description'], self.task.description)
+
+    def test_revisions_and_additions_share_a_valid_dependency_graph(self):
+        self.add_task(depends_on=[str(self.prerequisite.pk)])
+        self.payload['updates'][0]['changes']['depends_on'] = ['recursion']
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        applied = self.apply(response)
+        self.assertEqual(applied.status_code, 200, applied.data)
+        new = Task.objects.get(title='Trace recursive countdown')
+        self.assertTrue(self.task.dependencies.filter(pk=new.pk).exists())
+        self.assertTrue(new.dependencies.filter(pk=self.prerequisite.pk).exists())
+        self.assertEqual(self.plan.goals.count(), 1)
+        self.assertFalse(self.client.get(f'/api/tasks/{self.task.pk}/').data['is_schedulable'])
+
+    def test_cycles_across_edits_and_additions_are_rejected(self):
+        self.add_task()
+        self.payload['updates'][0]['changes']['depends_on'] = ['recursion']
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 502, response.data)
+        self.assertFalse(self.plan.changes.exists())
+        self.assertEqual(Task.objects.count(), 2)
+
+    def test_cross_plan_self_and_unknown_dependencies_are_rejected(self):
+        import copy
+        import uuid
+
+        foreign_plan = Plan.objects.create(user=self.user, title='Private', raw_input='Private')
+        foreign_goal = Goal.objects.create(user=self.user, plan=foreign_plan, title='Other')
+        foreign = Task.objects.create(goal=foreign_goal, title='Foreign')
+        for ref in [str(self.task.pk), str(foreign.pk), 'unknown']:
+            with self.subTest(ref=ref):
+                payload = copy.deepcopy(self.payload)
+                payload['updates'][0]['changes']['depends_on'] = [ref]
+                response, _ = self.propose(payload, {**self.request, 'client_id': str(uuid.uuid4())})
+                self.assertEqual(response.status_code, 502, response.data)
+                self.assertFalse(self.plan.changes.exists())
+
+    def test_readonly_progress_dates_and_goal_changes_are_rejected(self):
+        import copy
+        import uuid
+
+        for field, value in [('is_completed', True), ('remaining_minutes', 10), ('progress_status', 'completed'),
+                             ('goal_id', str(self.goal.pk)), ('due_date', '2027-01-01'), ('planning_context_version', 5)]:
+            with self.subTest(field=field):
+                payload = copy.deepcopy(self.payload)
+                payload['updates'][0]['changes'][field] = value
+                response, _ = self.propose(payload, {**self.request, 'client_id': str(uuid.uuid4())})
+                self.assertEqual(response.status_code, 502, response.data)
+        self.assertFalse(self.plan.changes.exists())
+
+    def test_completed_and_skipped_work_require_explicit_reopening(self):
+        self.report(status='completed', remaining_minutes=0)
+        self.assertEqual(self.propose()[0].status_code, 502)
+        self.report(status='reopened', remaining_minutes=20)
+        self.report(status='skipped', remaining_minutes=20)
+        self.assertEqual(self.propose()[0].status_code, 502)
+
+    def test_external_blockers_cannot_be_cleared_by_ai(self):
+        self.report(status='blocked', remaining_minutes=20, blocker_reason='Awaiting course access.')
+        self.payload['updates'][0]['changes']['blocker_reason'] = ''
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 502, response.data)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.blocker_reason, 'Awaiting course access.')
+
+    def test_original_estimate_cannot_override_reported_remaining_effort(self):
+        self.report()
+        self.payload['updates'][0]['changes']['estimated_minutes'] = 15
+        self.assertEqual(self.propose()[0].status_code, 502)
+
+    def test_publishing_and_published_tasks_are_protected(self):
+        for status in ['publishing', 'published']:
+            with self.subTest(status=status):
+                session = self.session(status=status)
+                response, _ = self.propose()
+                self.assertEqual(response.status_code, 502, response.data)
+                session.delete()
+        self.assertFalse(self.plan.changes.exists())
+
+    def test_publication_after_proposal_is_rechecked_without_partial_writes(self):
+        self.add_task()
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.session(status='published')
+        with patch('calendars.sessions.event_request') as event:
+            applied = self.apply(response)
+        self.assertEqual(applied.status_code, 400, applied.data)
+        event.assert_not_called()
+        self.assertEqual(Task.objects.count(), 2)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.description, 'Write a list traversal loop.')
+
+    def test_deleted_restored_task_identity_still_protects_committed_session(self):
+        session = self.session(status='published')
+        session.task = None
+        session.save()
+        self.assertEqual(self.propose()[0].status_code, 502)
+
+    def test_reject_replay_and_request_intent_isolation(self):
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        change = response.data['change']['id']
+        rejected = self.client.post(f'/api/conversations/plans/{self.plan.pk}/changes/{change}/reject/')
+        self.assertEqual(rejected.status_code, 200)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.description, 'Write a list traversal loop.')
+        replay, gateway = self.propose()
+        self.assertEqual(replay.status_code, 200, replay.data)
+        self.assertEqual(replay.data['change']['status'], 'rejected')
+        gateway.assert_not_called()
+        self.assertEqual(self.client.post(f'/api/plans/{self.plan.pk}/tasks/propose/', self.request, format='json').status_code, 409)
+        self.assertEqual(self.client.post(f'/api/conversations/plans/{self.plan.pk}/messages/', {
+            'content': self.request['focus'], 'client_id': self.request['client_id']}, format='json').status_code, 409)
+
+    def test_outcome_after_proposal_makes_it_stale(self):
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.report()
+        self.assertEqual(self.apply(response).status_code, 409)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.description, 'Write a list traversal loop.')
+
+    def test_outcome_during_ai_generation_discards_result(self):
+        def generate(**kwargs):
+            self.report()
+            return self.payload
+        gateway = Mock()
+        gateway.generate_json.side_effect = generate
+        with patch('goals.task_planning.get_ai_gateway', return_value=gateway):
+            response = self.client.post(self.url, self.request, format='json')
+        self.assertEqual(response.status_code, 409, response.data)
+        self.assertFalse(self.plan.changes.exists())
+
+    def test_empty_response_saves_reply_but_no_change(self):
+        response, _ = self.propose({'reply': 'Which course are you waiting for?', 'summary': 'Need context', 'updates': [], 'goals': []})
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertIsNone(response.data['change'])
+        self.assertFalse(self.plan.changes.exists())
+        replay, gateway = self.propose()
+        self.assertEqual(replay.status_code, 200)
+        gateway.assert_not_called()
+
+    def test_failed_request_can_retry_same_id(self):
+        with patch('goals.task_planning.get_ai_gateway', return_value=StubGateway(error=RuntimeError('provider failed'))):
+            self.assertEqual(self.client.post(self.url, self.request, format='json').status_code, 502)
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(Message.objects.filter(client_id=self.request['client_id']).count(), 1)
+
+    def test_prompt_contains_real_outcomes_and_protected_ids(self):
+        import json
+
+        self.report()
+        self.session(status='published', task=self.prerequisite)
+        gateway = Mock()
+        gateway.generate_json.return_value = self.payload
+        with patch('goals.task_planning.get_ai_gateway', return_value=gateway):
+            response = self.client.post(self.url, self.request, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        prompt = json.loads(gateway.generate_json.call_args.kwargs['prompt'])['persistent_plan']
+        self.assertEqual(prompt['recent_task_outcomes'][0]['notes'], 'I understand loops but recursion is difficult.')
+        self.assertIn(str(self.prerequisite.pk), prompt['protected_task_ids'])
+        self.assertEqual(prompt['goals'][0]['tasks'][0]['remaining_minutes'], 20)
+
+    def test_restore_replanning_revision_keeps_its_readiness_and_reported_progress(self):
+        from goals.services import restore_plan_revision
+
+        self.report()
+        self.payload['updates'][0]['changes'].update(readiness='blocked', blocker_reason='Awaiting a review of the exercise.')
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(self.apply(response).status_code, 200)
+        self.plan.refresh_from_db()
+        revision = self.plan.revisions.get(version=self.plan.version)
+        restore_plan_revision(revision, self.user)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.readiness, 'blocked')
+        self.assertEqual(self.task.blocker_reason, 'Awaiting a review of the exercise.')
+        self.assertEqual(self.task.remaining_minutes, 20)
+        self.assertEqual(self.task.progress_status, 'partial')
+
+    def test_owner_only_authentication_and_open_questions_gate_ai(self):
+        from goals.models import PlanQuestion
+
+        other = User.objects.create_user(email='other-replan@example.com')
+        self.client.force_authenticate(other)
+        self.assertEqual(self.client.post(self.url, self.request, format='json').status_code, 404)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.post(self.url, self.request, format='json').status_code, 401)
+        self.client.force_authenticate(self.user)
+        PlanQuestion.objects.create(plan=self.plan, text='Which course?', field='other', required=True)
+        response, gateway = self.propose()
+        self.assertEqual(response.status_code, 400)
+        gateway.assert_not_called()
+
+    def test_database_failure_rolls_back_edits_additions_and_reservations(self):
+        self.add_task()
+        session = self.session()
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        with patch('tasks.models.TaskDependency.objects.bulk_create', side_effect=RuntimeError('database failed')):
+            with self.assertRaises(RuntimeError):
+                self.apply(response)
+        self.task.refresh_from_db()
+        session.refresh_from_db()
+        self.plan.refresh_from_db()
+        self.assertEqual(Task.objects.count(), 2)
+        self.assertEqual(self.task.description, 'Write a list traversal loop.')
+        self.assertEqual(session.status, 'proposed')
+        self.assertEqual(self.plan.version, self.request['plan_version'])
+        self.assertEqual(self.plan.changes.get().status, 'proposed')
+
+    def test_review_can_reaffirm_context_and_replay_after_apply(self):
+        self.plan.context_version = 2
+        self.plan.save()
+        self.payload['updates'][0]['changes'] = {'readiness': 'ready'}
+        response, _ = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(self.apply(response).status_code, 200)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.planning_context_version, 2)
+        replay, gateway = self.propose()
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(replay.data['change']['status'], 'applied')
+        gateway.assert_not_called()
+
+    def test_noop_invalid_resource_duplicate_work_and_malformed_output_are_rejected(self):
+        import copy
+        import uuid
+
+        for changes in [{'description': self.task.description},
+                        {'description': 'Follow https://invented.example/course'},
+                        {'title': self.prerequisite.title, 'completion_criteria': self.prerequisite.completion_criteria},
+                        {'depends_on': [str(self.prerequisite.pk), str(self.prerequisite.pk).upper()]}]:
+            with self.subTest(changes=changes):
+                payload = copy.deepcopy(self.payload)
+                payload['updates'][0]['changes'] = changes
+                response, _ = self.propose(payload, {**self.request, 'client_id': str(uuid.uuid4())})
+                self.assertEqual(response.status_code, 502, response.data)
+        self.assertEqual(self.propose({**self.payload, 'unexpected': True})[0].status_code, 502)
+        self.assertFalse(self.plan.changes.exists())
