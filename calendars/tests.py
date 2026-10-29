@@ -821,3 +821,684 @@ class TaskSessionTests(APITestCase):
         with patch('calendars.sessions.event_request', side_effect=lambda user, current, method, payload=None: (201, payload)):
             response = self.approve(session)
         self.assertEqual(response.status_code, 200, response.data)
+
+
+class SessionManagementTests(APITestCase):
+    def setUp(self):
+        import copy
+        import uuid
+        from goals.models import Goal, Plan
+        from tasks.models import Task
+        from .models import WorkSession, SchedulingPreferences
+        from .sessions import snapshot
+
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.user = get_user_model().objects.create_user(email='management@example.com', google_sub='subject')
+        self.client.force_authenticate(self.user)
+        self.plan = Plan.objects.create(user=self.user, title='Study', raw_input='Study')
+        self.goal = Goal.objects.create(user=self.user, plan=self.plan, title='Arrays')
+        self.task = Task.objects.create(goal=self.goal, title='Write traversal', description='Write a loop.',
+            estimated_minutes=60, completion_criteria='Print five values.', readiness='ready')
+        self.start = (timezone.now() + timedelta(days=10)).replace(hour=9, minute=0, second=0, microsecond=0)
+        SchedulingPreferences.objects.create(user=self.user, timezone='UTC', working_hours=[
+            {'weekday': day, 'start_time': '09:00', 'end_time': '17:00'} for day in range(7)])
+        CalendarConnection.objects.create(user=self.user, google_sub='subject', email=self.user.email,
+            credentials='unused', expires_at=timezone.now() + timedelta(hours=1), source_calendars=['target', 'source'], destination_calendar='target')
+        session_id = uuid.uuid4()
+        payload = {'id': session_id.hex, 'summary': self.task.title, 'description': self.task.description,
+            'start': {'dateTime': self.start.isoformat()}, 'end': {'dateTime': (self.start + timedelta(hours=1)).isoformat()},
+            'extendedProperties': {'private': {'yiyara_session_id': str(session_id), 'other_key': 'preserve'}}}
+        self.session = WorkSession.objects.create(id=session_id, user=self.user, task=self.task, status='published',
+            starts_at=self.start, ends_at=self.start + timedelta(hours=1), expires_at=self.start,
+            destination_calendar='target', google_sub='subject', google_event_id=session_id.hex,
+            task_snapshot=snapshot(self.task), event_payload=payload, published_at=timezone.now())
+        self.event = {**copy.deepcopy(payload), 'etag': '"version-1"', 'status': 'confirmed'}
+        self.events = []
+        self.other_busy = []
+        self.writes = []
+        self.timeout_after_write = False
+        self.timeout_before_write = False
+        self.force412 = False
+        self.counter = 1
+        patch('calendars.services.access_token', return_value='test-token').start()
+        patch('calendars.services.list_calendars', return_value=[{'id': 'target', 'accessRole': 'owner'}]).start()
+        self.api = patch('calendars.services.api', side_effect=self.calendar_api).start()
+        self.real_request_json = services.request_json
+        self.transport = patch('calendars.services.request_json', side_effect=self.provider).start()
+        self.addCleanup(patch.stopall)
+
+    def calendar_api(self, user, method, path, **kwargs):
+        import copy
+
+        if path == 'freeBusy':
+            return {'calendars': {item['id']: {'busy': self.other_busy} for item in kwargs['json']['items']}}
+        if method == 'GET' and path == 'calendars/target/events':
+            return {'timeZone': 'UTC', 'items': copy.deepcopy(([self.event] if self.event else []) + self.events)}
+        raise AssertionError((method, path))
+
+    def provider(self, method, url, **kwargs):
+        import copy
+
+        self.assertTrue(url.endswith('/calendars/target/events/' + self.session.google_event_id))
+        if method == 'GET':
+            return (200, copy.deepcopy(self.event)) if self.event else (404, {})
+        self.assertIn(method, ('PATCH', 'DELETE'))
+        if self.timeout_before_write:
+            self.timeout_before_write = False
+            raise services.CalendarError('Timeout')
+        if self.force412 or (self.event and kwargs['headers'].get('If-Match') != self.event['etag']):
+            return 412, {}
+        self.writes.append((method, copy.deepcopy(kwargs)))
+        if method == 'DELETE':
+            self.event = None
+            result = (204, {})
+        else:
+            self.event.update(copy.deepcopy(kwargs['json']))
+            self.counter += 1
+            self.event['etag'] = f'"version-{self.counter}"'
+            result = (200, copy.deepcopy(self.event))
+        if self.timeout_after_write:
+            self.timeout_after_write = False
+            raise services.CalendarError('Timeout after provider write')
+        return result
+
+    def move(self, **changes):
+        import uuid
+
+        return self.client.post(f'/api/sessions/{self.session.pk}/reschedule/', {
+            'client_id': str(uuid.uuid4()), 'time_min': (self.start + timedelta(hours=2)).isoformat(),
+            'time_max': (self.start + timedelta(hours=6)).isoformat(), 'reason': 'Prefer afternoon.', **changes}, format='json')
+
+    def cancel(self, **changes):
+        import uuid
+
+        return self.client.post(f'/api/sessions/{self.session.pk}/cancel/', {
+            'client_id': str(uuid.uuid4()), 'reason': 'No longer want this calendar session.', **changes}, format='json')
+
+    def approve_change(self, response, **fields):
+        return self.client.post(f"/api/sessions/changes/{response.data['change']['id']}/approve/", fields, format='json')
+
+    def test_move_updates_same_event_after_approval_and_preserves_task_and_extra_properties(self):
+        response = self.move()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertFalse(self.writes)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.starts_at, self.start)
+        result = self.approve_change(response)
+        self.assertEqual(result.status_code, 200, result.data)
+        self.session.refresh_from_db()
+        self.task.refresh_from_db()
+        self.assertEqual(self.session.starts_at, self.start + timedelta(hours=2))
+        self.assertEqual(self.session.ends_at - self.session.starts_at, timedelta(hours=1))
+        self.assertEqual(self.session.management_version, 1)
+        self.assertEqual(self.session.status, 'published')
+        self.assertEqual(self.event['id'], self.session.google_event_id)
+        self.assertEqual(self.event['extendedProperties']['private']['other_key'], 'preserve')
+        self.assertEqual(self.event['summary'], self.task.title)
+        self.assertFalse(self.task.is_completed)
+        self.assertEqual(self.task.progress_version, 0)
+        self.assertEqual([method for method, _ in self.writes], ['PATCH'])
+        self.assertEqual(self.writes[0][1]['headers']['If-Match'], '"version-1"')
+        self.assertEqual(self.approve_change(response).status_code, 200)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_cancel_preserves_progress_releases_task_and_cannot_be_republished(self):
+        response = self.cancel()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertFalse(self.writes)
+        result = self.approve_change(response)
+        self.assertEqual(result.status_code, 200, result.data)
+        self.session.refresh_from_db()
+        self.task.refresh_from_db()
+        self.assertEqual(self.session.status, 'cancelled')
+        self.assertIsNotNone(self.session.cancelled_at)
+        self.assertFalse(self.task.is_completed)
+        self.assertEqual(self.task.progress_status, 'not_started')
+        self.assertEqual(self.writes[0][0], 'DELETE')
+        self.assertEqual(self.approve_change(response).status_code, 200)
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.client.post(f'/api/sessions/{self.session.pk}/approve/').status_code, 409)
+        new = self.client.post(f'/api/tasks/{self.task.pk}/sessions/propose/', {
+            'time_min': self.start.isoformat(), 'time_max': (self.start + timedelta(hours=8)).isoformat()}, format='json')
+        self.assertEqual(new.status_code, 201, new.data)
+
+    def test_overlap_with_original_event_still_checks_other_overlapping_events(self):
+        # The original event is 09:00–10:00. Another event inside it must not be subtracted away.
+        self.events = [{'id': 'other', 'start': {'dateTime': (self.start + timedelta(minutes=45)).isoformat()},
+                        'end': {'dateTime': (self.start + timedelta(hours=1)).isoformat()}}]
+        response = self.move(time_min=(self.start + timedelta(minutes=30)).isoformat(),
+                             time_max=(self.start + timedelta(hours=3)).isoformat())
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data['change']['starts_at'], (self.start + timedelta(hours=1)).isoformat().replace('+00:00', 'Z'))
+        # Without the unrelated busy event an overlapping move to 09:30 is allowed.
+        self.events = []
+        replacement = self.move(time_min=(self.start + timedelta(minutes=30)).isoformat(),
+                                time_max=(self.start + timedelta(hours=3)).isoformat())
+        self.assertEqual(replacement.status_code, 201, replacement.data)
+        self.assertEqual(replacement.data['change']['starts_at'], (self.start + timedelta(minutes=30)).isoformat().replace('+00:00', 'Z'))
+
+    def test_other_sources_grey_periods_and_other_reservations_block_move(self):
+        from .models import ProtectedPeriod, WorkSession
+        from tasks.models import Task
+        import uuid
+
+        left = self.start + timedelta(hours=2)
+        self.other_busy = [{'start': left.isoformat(), 'end': (left + timedelta(hours=1)).isoformat()}]
+        ProtectedPeriod.objects.create(user=self.user, kind='one_off', starts_at=left + timedelta(hours=1), ends_at=left + timedelta(hours=2))
+        other = Task.objects.create(goal=self.goal, title='Other')
+        WorkSession.objects.create(user=self.user, task=other, starts_at=left + timedelta(hours=2), ends_at=left + timedelta(hours=3),
+            expires_at=left, google_event_id=uuid.uuid4().hex, destination_calendar='target', google_sub='subject')
+        response = self.move()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data['change']['starts_at'], (left + timedelta(hours=3)).isoformat().replace('+00:00', 'Z'))
+
+    def test_new_conflict_after_proposal_prevents_patch(self):
+        response = self.move()
+        self.assertEqual(response.status_code, 201)
+        left = self.start + timedelta(hours=2)
+        self.events = [{'id': 'new', 'start': {'dateTime': left.isoformat()}, 'end': {'dateTime': (left + timedelta(hours=1)).isoformat()}}]
+        result = self.approve_change(response)
+        self.assertEqual(result.status_code, 409, result.data)
+        self.assertFalse(self.writes)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.starts_at, self.start)
+
+    def test_provider_changes_after_proposal_and_at_conditional_write_are_not_overwritten(self):
+        response = self.move()
+        self.event['etag'] = '"external-edit"'
+        self.event['summary'] = 'User edit'
+        self.assertEqual(self.approve_change(response).status_code, 409)
+        self.assertFalse(self.writes)
+        replacement = self.move()
+        self.assertEqual(replacement.status_code, 201, replacement.data)
+        self.force412 = True
+        result = self.approve_change(replacement)
+        self.assertEqual(result.status_code, 409, result.data)
+        from .models import SessionChange
+        self.assertEqual(SessionChange.objects.get(pk=replacement.data['change']['id']).status, 'proposed')
+        self.assertEqual(self.event['summary'], 'User edit')
+
+    def test_patch_timeout_reconciles_same_change_without_second_write(self):
+        from .models import SessionChange
+
+        response = self.move()
+        self.timeout_after_write = True
+        self.assertEqual(self.approve_change(response).status_code, 502)
+        change = SessionChange.objects.get(pk=response.data['change']['id'])
+        self.assertEqual(change.status, 'applying')
+        self.assertEqual(self.move().status_code, 409)
+        self.assertEqual(self.client.post(f'/api/sessions/changes/{change.pk}/reject/').status_code, 409)
+        self.assertEqual(self.approve_change(response).status_code, 200)
+        self.assertEqual(len(self.writes), 1)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.starts_at, self.start + timedelta(hours=2))
+
+    def test_delete_timeout_reconciles_absence_without_second_delete(self):
+        response = self.cancel()
+        self.timeout_after_write = True
+        self.assertEqual(self.approve_change(response).status_code, 502)
+        self.assertIsNone(self.event)
+        self.assertEqual(self.approve_change(response).status_code, 200)
+        self.assertEqual(len(self.writes), 1)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, 'cancelled')
+
+    def test_timeout_before_provider_write_retries_same_etag(self):
+        response = self.move()
+        self.timeout_before_write = True
+        self.assertEqual(self.approve_change(response).status_code, 502)
+        self.assertFalse(self.writes)
+        self.assertEqual(self.approve_change(response).status_code, 200)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_deleted_event_cancellation_is_local_only_and_move_does_not_recreate_it(self):
+        self.event = None
+        self.assertEqual(self.move().status_code, 409)
+        response = self.cancel()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(self.approve_change(response).status_code, 200)
+        self.assertFalse(self.writes)
+
+    def test_identity_mismatch_guest_events_and_recurring_events_are_protected(self):
+        import copy
+
+        original = copy.deepcopy(self.event)
+        for mutation in ['identity', 'guest', 'recurrence']:
+            self.event = copy.deepcopy(original)
+            if mutation == 'identity':
+                self.event['extendedProperties']['private']['yiyara_session_id'] = 'unrelated'
+            elif mutation == 'guest':
+                self.event['attendees'] = [{'email': 'guest@example.com'}]
+            else:
+                self.event['recurrence'] = ['RRULE:FREQ=WEEKLY']
+            with self.subTest(mutation=mutation):
+                self.assertEqual(self.cancel().status_code, 409)
+                self.assertEqual(self.move().status_code, 409)
+        self.assertFalse(self.writes)
+
+    def test_idempotent_request_replay_and_new_proposal_replaces_only_after_success(self):
+        import uuid
+        from .models import SessionChange
+
+        client_id = str(uuid.uuid4())
+        response = self.move(client_id=client_id)
+        replay = self.move(client_id=client_id)
+        self.assertEqual(replay.status_code, 200, replay.data)
+        self.assertEqual(replay.data['change']['id'], response.data['change']['id'])
+        self.assertEqual(self.cancel(client_id=client_id).status_code, 409)
+        # An impossible replacement must not discard the useful old proposal.
+        impossible = self.move(time_min=self.start.replace(hour=18).isoformat(), time_max=self.start.replace(hour=19).isoformat())
+        self.assertEqual(impossible.status_code, 409)
+        self.assertEqual(SessionChange.objects.get(pk=response.data['change']['id']).status, 'proposed')
+        replacement = self.cancel()
+        self.assertEqual(replacement.status_code, 201)
+        self.assertEqual(SessionChange.objects.get(pk=response.data['change']['id']).status, 'rejected')
+        self.assertEqual(self.client.post(f"/api/sessions/changes/{replacement.data['change']['id']}/reject/").status_code, 200)
+        self.assertFalse(self.writes)
+
+    def test_outcome_invalidates_pending_move_and_is_blocked_during_uncertain_write(self):
+        import uuid
+        from .models import SessionChange
+
+        response = self.move()
+        body = {'client_id': str(uuid.uuid4()), 'plan_version': self.plan.version, 'status': 'partial', 'remaining_minutes': 20}
+        reported = self.client.post(f'/api/tasks/{self.task.pk}/outcomes/', body, format='json')
+        self.assertEqual(reported.status_code, 201, reported.data)
+        self.assertEqual(SessionChange.objects.get(pk=response.data['change']['id']).status, 'rejected')
+        # Cancellation remains possible after progress; uncertain cancellation blocks new outcomes.
+        cancellation = self.cancel()
+        self.timeout_before_write = True
+        self.assertEqual(self.approve_change(cancellation).status_code, 502)
+        body.update(client_id=str(uuid.uuid4()), plan_version=reported.data['plan_version'])
+        self.assertEqual(self.client.post(f'/api/tasks/{self.task.pk}/outcomes/', body, format='json').status_code, 409)
+
+    def test_past_or_completed_session_cannot_move_but_can_be_cancelled(self):
+        self.task.is_completed = True
+        self.task.save()
+        self.assertEqual(self.move().status_code, 400)
+        response = self.cancel()
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(self.approve_change(response).status_code, 200)
+        self.task.refresh_from_db()
+        self.assertTrue(self.task.is_completed)
+
+    def test_foreign_account_ownership_and_unauthenticated_requests(self):
+        response = self.move()
+        other = get_user_model().objects.create_user(email='foreign-calendar@example.com')
+        self.client.force_authenticate(other)
+        self.assertEqual(self.move().status_code, 404)
+        self.assertEqual(self.approve_change(response).status_code, 404)
+        self.assertEqual(self.client.get(f"/api/sessions/changes/{response.data['change']['id']}/").status_code, 404)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.move().status_code, 401)
+        self.client.force_authenticate(self.user)
+        CalendarConnection.objects.filter(user=self.user).update(google_sub='different')
+        self.assertEqual(self.cancel().status_code, 409)
+        self.assertFalse(self.writes)
+
+    def test_all_day_events_and_transparent_events_in_destination(self):
+        self.events = [{'id': 'all-day', 'start': {'date': self.start.date().isoformat()},
+                        'end': {'date': (self.start + timedelta(days=1)).date().isoformat()}}]
+        occupied = self.move()
+        self.assertEqual(occupied.status_code, 201, occupied.data)
+        self.assertTrue(occupied.data['change']['requires_conflict_approval'])
+        self.events[0]['transparency'] = 'transparent'
+        free = self.move()
+        self.assertEqual(free.status_code, 201)
+        self.assertFalse(free.data['change']['requires_conflict_approval'])
+
+    def test_pending_move_reserves_target_for_other_task_proposals(self):
+        from tasks.models import Task
+
+        response = self.move()
+        self.assertEqual(response.status_code, 201)
+        other = Task.objects.create(goal=self.goal, title='Another exercise', estimated_minutes=60,
+                                    completion_criteria='Done', readiness='ready')
+        proposed = self.client.post(f'/api/tasks/{other.pk}/sessions/propose/', {
+            'time_min': (self.start + timedelta(hours=2)).isoformat(),
+            'time_max': (self.start + timedelta(hours=5)).isoformat()}, format='json')
+        self.assertEqual(proposed.status_code, 201, proposed.data)
+        self.assertEqual(proposed.data['starts_at'], (self.start + timedelta(hours=3)).isoformat().replace('+00:00', 'Z'))
+
+    def test_request_validation_expiry_and_live_lease(self):
+        from .models import SessionChange
+
+        self.assertEqual(self.client.post(f'/api/sessions/{self.session.pk}/reschedule/', [], format='json').status_code, 400)
+        response = self.move()
+        change = SessionChange.objects.get(pk=response.data['change']['id'])
+        change.expires_at = timezone.now() - timedelta(seconds=1)
+        change.save()
+        self.assertEqual(self.approve_change(response).status_code, 409)
+        change.lease_until = timezone.now() + timedelta(minutes=1)
+        change.save()
+        self.assertEqual(self.move().status_code, 409)
+        self.assertEqual(self.approve_change(response).status_code, 409)
+        self.assertFalse(self.writes)
+
+    def test_delete_transport_accepts_empty_204_body(self):
+        import httpx
+
+        with patch('calendars.services.httpx.request', return_value=httpx.Response(204)):
+            self.assertEqual(self.real_request_json('DELETE', 'https://example.invalid/event'), (204, {}))
+
+    def test_external_edit_after_uncertain_move_is_not_overwritten_and_allows_explicit_cancel(self):
+        response = self.move()
+        self.timeout_after_write = True
+        self.assertEqual(self.approve_change(response).status_code, 502)
+        self.event['etag'] = '"external-later"'
+        self.event['start'] = {'dateTime': (self.start + timedelta(hours=4)).isoformat()}
+        self.event['end'] = {'dateTime': (self.start + timedelta(hours=5)).isoformat()}
+        result = self.approve_change(response)
+        self.assertEqual(result.status_code, 409, result.data)
+        self.assertEqual(result.data['change']['status'], 'conflicted')
+        self.assertEqual(len(self.writes), 1)
+        cancellation = self.cancel()
+        self.assertEqual(cancellation.status_code, 201, cancellation.data)
+        self.assertEqual(self.approve_change(cancellation).status_code, 200)
+        self.assertEqual([method for method, _ in self.writes], ['PATCH', 'DELETE'])
+
+    def test_destination_listing_paginates_and_handles_empty_collections(self):
+        calls = []
+        original = self.calendar_api
+        def pages(user, method, path, **kwargs):
+            if method == 'GET' and path == 'calendars/target/events':
+                calls.append(kwargs['params'].get('pageToken'))
+                if not kwargs['params'].get('pageToken'):
+                    return {'items': [], 'nextPageToken': 'second', 'timeZone': 'UTC'}
+                return {'timeZone': 'UTC'}
+            return original(user, method, path, **kwargs)
+        self.api.side_effect = pages
+        response = self.move()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(calls, [None, 'second'])
+
+    def test_session_account_original_calendar_is_used_when_default_destination_changes(self):
+        CalendarConnection.objects.filter(user=self.user).update(destination_calendar='a-new-default')
+        response = self.cancel()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(self.approve_change(response).status_code, 200)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_expired_intent_reconciles_already_completed_remote_move(self):
+        from .models import SessionChange
+
+        response = self.move()
+        self.timeout_after_write = True
+        self.assertEqual(self.approve_change(response).status_code, 502)
+        SessionChange.objects.filter(pk=response.data['change']['id']).update(expires_at=timezone.now() - timedelta(days=1))
+        self.assertEqual(self.approve_change(response).status_code, 200)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_scheduling_change_just_before_patch_keeps_proposal_rejectable(self):
+        from . import management
+        from .models import ProtectedPeriod, SessionChange
+
+        response = self.move()
+        original = management.check_slot
+        calls = []
+        def protect(user, session, change):
+            calls.append(True)
+            if len(calls) == 2:
+                ProtectedPeriod.objects.create(user=user, kind='one_off', starts_at=change.starts_at, ends_at=change.ends_at)
+            return original(user, session, change)
+        with patch('calendars.management.check_slot', side_effect=protect):
+            result = self.approve_change(response)
+        self.assertEqual(result.status_code, 409, result.data)
+        self.assertFalse(self.writes)
+        self.assertEqual(SessionChange.objects.get(pk=response.data['change']['id']).status, 'proposed')
+        self.assertEqual(self.client.post(f"/api/sessions/changes/{response.data['change']['id']}/reject/").status_code, 200)
+
+    def test_local_save_failure_after_remote_move_is_recoverable(self):
+        from .models import SessionChange
+
+        response = self.move()
+        with patch('calendars.management.finalize', side_effect=RuntimeError('database failure')):
+            with self.assertRaises(RuntimeError):
+                self.approve_change(response)
+        self.assertEqual(SessionChange.objects.get(pk=response.data['change']['id']).status, 'applying')
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.starts_at, self.start)
+        self.assertEqual(self.approve_change(response).status_code, 200)
+        self.assertEqual(len(self.writes), 1)
+
+
+    def test_reschedule_overlap_requires_explicit_consent_and_preserves_the_conflicting_event(self):
+        left = self.start + timedelta(hours=2)
+        other = {'id': 'unrelated', 'summary': 'Existing appointment', 'start': {'dateTime': left.isoformat()},
+                 'end': {'dateTime': (left + timedelta(hours=1)).isoformat()}}
+        self.events = [other]
+        response = self.move(preferred_start=left.isoformat())
+        self.assertEqual(response.status_code, 201, response.data)
+        change = response.data['change']
+        self.assertTrue(change['requires_conflict_approval'])
+        self.assertEqual(self.approve_change(response).status_code, 409)
+        result = self.approve_change(response, allow_overlap=True, conflict_token=change['conflict_token'])
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertEqual(self.events, [other])
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.writes[0][0], 'PATCH')
+        self.assertTrue(result.data['session']['overlap_approved'])
+        self.assertEqual(len(result.data['session']['overlap_history']), 1)
+
+    def test_find_another_reschedule_avoids_the_reviewed_occupancy(self):
+        left = self.start + timedelta(hours=2)
+        self.events = [{'id': 'unrelated', 'start': {'dateTime': left.isoformat()},
+                        'end': {'dateTime': (left + timedelta(hours=1)).isoformat()}}]
+        occupied = self.move(preferred_start=left.isoformat())
+        self.assertTrue(occupied.data['change']['requires_conflict_approval'])
+        alternative = self.move(conflict_policy='avoid')
+        self.assertEqual(alternative.status_code, 201, alternative.data)
+        self.assertFalse(alternative.data['change']['requires_conflict_approval'])
+        self.assertEqual(alternative.data['change']['starts_at'], (left + timedelta(hours=1)).isoformat().replace('+00:00', 'Z'))
+
+    def test_uncertain_overlapping_reschedule_reconciles_saved_approval(self):
+        left = self.start + timedelta(hours=2)
+        self.other_busy = [{'start': left.isoformat(), 'end': (left + timedelta(hours=1)).isoformat()}]
+        response = self.move(preferred_start=left.isoformat())
+        self.timeout_after_write = True
+        failed = self.approve_change(response, allow_overlap=True, conflict_token=response.data['change']['conflict_token'])
+        self.assertEqual(failed.status_code, 502, failed.data)
+        reconciled = self.approve_change(response)
+        self.assertEqual(reconciled.status_code, 200, reconciled.data)
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(len(reconciled.data['session']['overlap_history']), 1)
+
+
+class OverlapSchedulingTests(APITestCase):
+    def setUp(self):
+        from goals.models import Plan, Goal
+        from tasks.models import Task
+        from .models import SchedulingPreferences
+
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.user = get_user_model().objects.create_user(email='overlap@example.com', google_sub='subject')
+        self.client.force_authenticate(self.user)
+        self.plan = Plan.objects.create(user=self.user, title='Study', raw_input='Study')
+        self.goal = Goal.objects.create(user=self.user, plan=self.plan, title='Arrays')
+        self.task = Task.objects.create(goal=self.goal, title='Array exercise', readiness='ready', estimated_minutes=60,
+                                        completion_criteria='Two solutions written.')
+        self.start = (timezone.now() + timedelta(days=10)).replace(hour=9, minute=0, second=0, microsecond=0)
+        self.end = self.start + timedelta(hours=4)
+        SchedulingPreferences.objects.create(user=self.user, timezone='UTC', working_hours=[
+            {'weekday': day, 'start_time': '09:00', 'end_time': '17:00'} for day in range(7)])
+        CalendarConnection.objects.create(user=self.user, google_sub='subject', email=self.user.email, credentials='unused',
+            expires_at=self.end, source_calendars=['source'], destination_calendar='target')
+        self.busy = {'source': [], 'target': []}
+        self.events = {}
+        self.writes = []
+        patch('calendars.services.access_token', return_value='token').start()
+        patch('calendars.services.list_calendars', return_value=[{'id': 'target', 'accessRole': 'owner'}]).start()
+        self.api = patch('calendars.services.api', side_effect=self.freebusy).start()
+        patch('calendars.services.request_json', side_effect=self.provider).start()
+        self.addCleanup(patch.stopall)
+
+    def freebusy(self, user, method, path, **kwargs):
+        return {'calendars': {item['id']: {'busy': self.busy[item['id']]} for item in kwargs['json']['items']}}
+
+    def provider(self, method, url, **kwargs):
+        import copy
+
+        if method == 'GET':
+            event = self.events.get(url.rsplit('/', 1)[-1])
+            return (200, copy.deepcopy(event)) if event else (404, {})
+        self.assertEqual(method, 'POST')
+        event = copy.deepcopy(kwargs['json'])
+        if event['id'] in self.events:
+            return 409, {}
+        self.events[event['id']] = event
+        self.writes.append(event)
+        return 201, event
+
+    def occupy(self, left=None, right=None, calendar='source'):
+        self.busy[calendar] = [{'start': (left or self.start).isoformat(), 'end': (right or self.end).isoformat()}]
+
+    def propose(self, **fields):
+        return self.client.post(f'/api/tasks/{self.task.pk}/sessions/propose/', {
+            'time_min': self.start.isoformat(), 'time_max': self.end.isoformat(), **fields}, format='json')
+
+    def approve(self, response, **fields):
+        return self.client.post(f"/api/sessions/{response.data['id']}/approve/", fields, format='json')
+
+    def test_busy_only_range_returns_review_then_explicit_overlap_preserves_other_events(self):
+        self.occupy()
+        response = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertTrue(response.data['requires_conflict_approval'])
+        self.assertEqual(response.data['conflicts'][0]['calendar_id'], 'source')
+        self.assertTrue(response.data['conflict_token'])
+        self.assertFalse(self.writes)
+        self.assertEqual(self.approve(response).status_code, 409)
+        self.assertEqual(self.approve(response, allow_overlap=True, conflict_token='wrong').status_code, 409)
+        approved = self.approve(response, allow_overlap=True, conflict_token=response.data['conflict_token'])
+        self.assertEqual(approved.status_code, 200, approved.data)
+        self.assertTrue(approved.data['overlap_approved'])
+        self.assertEqual(len(approved.data['overlap_history']), 1)
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(len(self.busy['source']), 1)
+        self.assertEqual(self.approve(response).status_code, 200)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_free_slots_are_preferred_but_explicit_preferred_start_can_be_occupied(self):
+        self.occupy(right=self.start + timedelta(hours=1))
+        free = self.propose()
+        self.assertEqual(free.status_code, 201)
+        self.assertFalse(free.data['conflicts'])
+        self.assertEqual(free.data['starts_at'], (self.start + timedelta(hours=1)).isoformat().replace('+00:00', 'Z'))
+        occupied = self.propose(preferred_start=self.start.isoformat())
+        self.assertEqual(occupied.status_code, 201, occupied.data)
+        self.assertTrue(occupied.data['requires_conflict_approval'])
+        self.assertEqual(occupied.data['starts_at'], self.start.isoformat().replace('+00:00', 'Z'))
+
+    def test_find_another_slot_avoids_conflicts_and_keeps_prior_proposal_if_no_free_time(self):
+        from .models import WorkSession
+
+        self.occupy()
+        occupied = self.propose()
+        alternative = self.propose(conflict_policy='avoid')
+        self.assertEqual(alternative.status_code, 409)
+        self.assertEqual(WorkSession.objects.get(pk=occupied.data['id']).status, 'proposed')
+        self.busy['source'][0]['end'] = (self.start + timedelta(hours=1)).isoformat()
+        alternative = self.propose(conflict_policy='avoid')
+        self.assertEqual(alternative.status_code, 201)
+        self.assertFalse(alternative.data['requires_conflict_approval'])
+        self.assertEqual(WorkSession.objects.get(pk=occupied.data['id']).status, 'rejected')
+
+    def test_grey_period_cannot_be_overridden_at_proposal_or_approval(self):
+        from .models import ProtectedPeriod
+
+        ProtectedPeriod.objects.create(user=self.user, kind='one_off', starts_at=self.start, ends_at=self.start + timedelta(hours=1))
+        self.occupy()
+        response = self.propose(preferred_start=self.start.isoformat())
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['starts_at'], (self.start + timedelta(hours=1)).isoformat().replace('+00:00', 'Z'))
+        ProtectedPeriod.objects.create(user=self.user, kind='one_off', starts_at=self.start + timedelta(hours=1), ends_at=self.end)
+        result = self.approve(response, allow_overlap=True, conflict_token=response.data['conflict_token'])
+        self.assertEqual(result.status_code, 409, result.data)
+        self.assertFalse(self.writes)
+        self.assertEqual(self.propose().status_code, 409)
+
+    def test_changed_or_new_conflict_requires_fresh_review(self):
+        self.occupy()
+        response = self.propose()
+        self.occupy(calendar='target')
+        result = self.approve(response, allow_overlap=True, conflict_token=response.data['conflict_token'])
+        self.assertEqual(result.status_code, 409)
+        self.assertFalse(self.writes)
+        replacement = self.propose()
+        self.assertNotEqual(replacement.data['conflict_token'], response.data['conflict_token'])
+        self.assertEqual(self.approve(replacement, allow_overlap=True, conflict_token=replacement.data['conflict_token']).status_code, 200)
+
+    def test_generic_approval_cannot_override_a_new_conflict_on_originally_free_proposal(self):
+        response = self.propose()
+        self.occupy()
+        self.assertEqual(self.approve(response, allow_overlap=True).status_code, 409)
+        self.assertFalse(self.writes)
+
+    def test_conflicts_are_rechecked_immediately_before_insert(self):
+        from . import sessions
+
+        self.occupy()
+        response = self.propose()
+        actual = sessions.event_request
+        def change_busy(user, session, method, payload=None):
+            self.occupy(calendar='target')
+            return actual(user, session, method, payload)
+        with patch('calendars.sessions.event_request', side_effect=change_busy):
+            result = self.approve(response, allow_overlap=True, conflict_token=response.data['conflict_token'])
+        self.assertEqual(result.status_code, 409, result.data)
+        self.assertFalse(self.writes)
+        from .models import WorkSession
+        saved = WorkSession.objects.get(pk=response.data['id'])
+        self.assertEqual(saved.status, 'proposed')
+        self.assertFalse(saved.overlap_approved)
+
+    def test_uncertain_overlap_publish_uses_saved_consent_on_retry(self):
+        from . import sessions
+
+        self.occupy()
+        response = self.propose()
+        actual = sessions.event_request
+        def timeout(user, session, method, payload=None):
+            result = actual(user, session, method, payload)
+            if method == 'POST':
+                raise services.CalendarError('Timeout after insert')
+            return result
+        with patch('calendars.sessions.event_request', side_effect=timeout):
+            result = self.approve(response, allow_overlap=True, conflict_token=response.data['conflict_token'])
+        self.assertEqual(result.status_code, 502)
+        self.assertEqual(self.approve(response).status_code, 200)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_published_yiyara_event_is_overridable_but_tentative_hold_is_not(self):
+        import uuid
+        from .models import WorkSession
+        from tasks.models import Task
+
+        other = Task.objects.create(goal=self.goal, title='Existing task')
+        session = WorkSession.objects.create(user=self.user, task=other, status='published', starts_at=self.start, ends_at=self.end,
+            expires_at=self.end, google_sub='subject', google_event_id=uuid.uuid4().hex, destination_calendar='old-calendar')
+        response = self.propose()
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(response.data['requires_conflict_approval'])
+        self.assertEqual(response.data['conflicts'][0]['calendar_id'], 'old-calendar')
+        session.status = 'publishing'
+        session.save()
+        self.assertEqual(self.propose().status_code, 409)
+        self.assertFalse(self.writes)
+
+    def test_conflict_data_is_merged_and_clipped_to_the_reviewed_slot(self):
+        self.busy['source'] = [
+            {'start': self.start.isoformat(), 'end': (self.start + timedelta(minutes=45)).isoformat()},
+            {'start': (self.start + timedelta(minutes=30)).isoformat(), 'end': self.end.isoformat()}]
+        response = self.propose()
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(len(response.data['conflicts']), 1)
+        self.assertEqual(response.data['conflicts'][0]['end'], (self.start + timedelta(hours=1)).isoformat())
+
+    def test_preferred_start_requires_explicit_offset_minute_alignment_and_in_range(self):
+        for value in ['2026-11-01T09:00:00', (self.start - timedelta(hours=1)).isoformat(),
+                      (self.start + timedelta(seconds=10)).isoformat(), (self.end - timedelta(minutes=1)).isoformat()]:
+            with self.subTest(value=value):
+                self.assertEqual(self.propose(preferred_start=value).status_code, 400)
