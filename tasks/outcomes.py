@@ -6,7 +6,7 @@ from django.shortcuts import get_object_or_404
 from rest_framework import serializers
 from rest_framework.exceptions import APIException
 
-from calendars.models import WorkSession
+from calendars.models import WorkSession, SessionChange
 from calendars.services import lock_user
 from goals.models import Plan
 from .models import Task, TaskOutcome
@@ -75,6 +75,9 @@ def apply_report(task, data):
 
 def append_report(task, plan, data, *, source='outcome'):
     """Caller holds the shared user lock and the plan transaction."""
+    if SessionChange.objects.filter(user_id=plan.user_id, status='applying',
+                                    session__task_snapshot__task_id=str(task.pk)).exists():
+        raise OutcomeConflict('A calendar change is unconfirmed. Retry approval of that change before reporting progress.')
     if data.get('session_id') and not WorkSession.objects.filter(
         pk=data['session_id'], user_id=plan.user_id, status='published', task_snapshot__task_id=str(task.pk),
     ).exists():
@@ -91,6 +94,8 @@ def append_report(task, plan, data, *, source='outcome'):
                       'source': source}, task_state=progress_state(task),
     )
     WorkSession.objects.filter(user_id=plan.user_id, task_snapshot__task_id=str(task.pk), status='proposed').update(status='rejected')
+    SessionChange.objects.filter(user_id=plan.user_id, session__task_snapshot__task_id=str(task.pk),
+                                 kind='reschedule', status='proposed').update(status='rejected')
     return outcome
 
 
