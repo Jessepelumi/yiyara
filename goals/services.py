@@ -149,7 +149,7 @@ def normalize_plan_operations(plan, operations):
         raise InvalidPlanOperation("Changes must contain no more than 25 operations")
 
     normalized = []
-    if any(isinstance(op, dict) and op.get('action') == 'add_task_batch' for op in operations) and len(operations) != 1:
+    if any(isinstance(op, dict) and op.get('action') in ('add_task_batch', 'replan_tasks') for op in operations) and len(operations) != 1:
         raise InvalidPlanOperation('Task batches must be reviewed separately from context changes.')
     supported_actions = {
         "add_goal",
@@ -165,6 +165,13 @@ def normalize_plan_operations(plan, operations):
             raise InvalidPlanOperation("Each change must be an object")
 
         action = operation.get("action")
+        if action == 'replan_tasks':
+            from .replanning import normalize_replan
+            try:
+                normalized.append(normalize_replan(plan, operation))
+            except ApiValidationError as exc:
+                raise InvalidPlanOperation(str(exc.detail)) from exc
+            continue
         if action == 'add_task_batch':
             from .task_planning import normalize_batch
             try:
@@ -313,6 +320,13 @@ def apply_plan_change(change, user):
         operations = normalize_plan_operations(plan, change.operations)
         for operation in operations:
             action = operation["action"]
+            if action == 'replan_tasks':
+                from .replanning import apply_replan
+                try:
+                    apply_replan(plan, operation)
+                except ApiValidationError as exc:
+                    raise InvalidPlanOperation(str(exc.detail)) from exc
+                continue
             if action == 'add_task_batch':
                 from .task_planning import apply_batch
                 try:
