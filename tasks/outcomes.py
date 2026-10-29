@@ -135,7 +135,7 @@ def record_completion_toggle(task, plan, completed):
 
 def preserve_reported_progress(task, plan):
     latest = TaskOutcome.objects.filter(plan=plan, task_id=task.pk).first()
-    if latest:
+    if latest and task.progress_version < latest.task_state.get('progress_version', 0):
         for field, value in latest.task_state.items():
             setattr(task, field, value)
         task.save(update_fields=[*latest.task_state, 'updated_at'])
