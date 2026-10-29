@@ -84,6 +84,7 @@ class QuestionAnswerView(APIView):
 class TaskPlanProposalView(APIView):
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = 'task_planning'
+    replanning = False
 
     def post(self, request, plan_id):
         from ai.providers.base import AIConfigurationError
@@ -94,7 +95,7 @@ class TaskPlanProposalView(APIView):
         serializer = TaskPlanningRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
-            assistant, change, replayed = propose_tasks(request.user, plan_id, serializer.validated_data)
+            assistant, change, replayed = propose_tasks(request.user, plan_id, serializer.validated_data, replanning=self.replanning)
             return Response({
                 'reply': assistant.content, 'message_id': assistant.pk,
                 'change': PlanChangeSerializer(change).data if change else None,
@@ -106,3 +107,7 @@ class TaskPlanProposalView(APIView):
             return Response({'error': 'ai_not_configured', 'message': 'Task planning AI is not configured.'}, status=503)
         except TaskPlanningError as exc:
             return Response({'error': 'task_planning_failed', 'message': str(exc)}, status=502)
+
+
+class ReplanProposalView(TaskPlanProposalView):
+    replanning = True
