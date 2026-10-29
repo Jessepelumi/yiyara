@@ -745,3 +745,79 @@ class TaskSessionTests(APITestCase):
         with patch('calendars.sessions.event_request', side_effect=lambda user, current, method, payload=None: (201, payload)):
             response = self.approve(session)
         self.assertEqual(response.status_code, 200, response.data)
+
+    def report_outcome(self, **changes):
+        import uuid
+
+        self.plan.refresh_from_db()
+        return self.client.post(f'/api/tasks/{self.task.pk}/outcomes/', {
+            'client_id': str(uuid.uuid4()), 'plan_version': self.plan.version, 'status': 'partial',
+            'remaining_minutes': 20, 'notes': 'First part completed.', **changes,
+        }, format='json')
+
+    def test_progress_releases_tentative_reservation_and_uses_remaining_effort(self):
+        session = self.session()
+        response = self.report_outcome()
+        self.assertEqual(response.status_code, 201, response.data)
+        session.refresh_from_db()
+        self.assertEqual(session.status, 'rejected')
+        with patch('calendars.sessions.event_request') as event:
+            self.assertEqual(self.approve(session).status_code, 409)
+        event.assert_not_called()
+        replacement = self.propose()
+        self.assertEqual(replacement.status_code, 201, replacement.data)
+        from datetime import datetime
+        starts = datetime.fromisoformat(replacement.data['starts_at'].replace('Z', '+00:00'))
+        ends = datetime.fromisoformat(replacement.data['ends_at'].replace('Z', '+00:00'))
+        self.assertEqual(ends - starts, timedelta(minutes=20))
+        self.assertEqual(replacement.data['task_snapshot']['estimated_minutes'], 60)
+        self.assertEqual(replacement.data['task_snapshot']['remaining_minutes'], 20)
+
+    def test_published_session_outcome_keeps_google_event_and_payload_unchanged(self):
+        session = self.session()
+        with patch('calendars.sessions.event_request', side_effect=lambda user, current, method, payload=None: (201, payload)):
+            self.assertEqual(self.approve(session).status_code, 200)
+        session.refresh_from_db()
+        original_payload = session.event_payload.copy()
+        with patch('calendars.sessions.event_request') as event:
+            response = self.report_outcome(status='completed', remaining_minutes=0, session_id=str(session.pk))
+        self.assertEqual(response.status_code, 201, response.data)
+        event.assert_not_called()
+        session.refresh_from_db()
+        self.assertEqual(session.status, 'published')
+        self.assertEqual(session.event_payload, original_payload)
+        self.assertEqual(response.data['outcome']['session_id'], str(session.pk))
+        self.assertEqual(response.data['task']['progress_status'], 'completed')
+
+    def test_unconfirmed_publication_blocks_outcomes_and_leaves_progress_unchanged(self):
+        from tasks.models import TaskOutcome
+
+        session = self.session()
+        session.status = 'publishing'
+        session.save()
+        response = self.report_outcome()
+        self.assertEqual(response.status_code, 409, response.data)
+        self.assertFalse(TaskOutcome.objects.exists())
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.progress_version, 0)
+
+    def test_outcome_cannot_claim_an_unpublished_or_another_tasks_session(self):
+        from tasks.models import Task
+
+        session = self.session()
+        self.assertEqual(self.report_outcome(session_id=str(session.pk)).status_code, 400)
+        other = Task.objects.create(goal=self.goal, title='Other')
+        session.task = other
+        session.task_snapshot['task_id'] = str(other.pk)
+        session.status = 'published'
+        session.save()
+        self.assertEqual(self.report_outcome(session_id=str(session.pk)).status_code, 400)
+
+    def test_legacy_snapshot_without_progress_fields_remains_publishable(self):
+        session = self.session()
+        for field in ('remaining_minutes', 'progress_version'):
+            session.task_snapshot.pop(field)
+        session.save()
+        with patch('calendars.sessions.event_request', side_effect=lambda user, current, method, payload=None: (201, payload)):
+            response = self.approve(session)
+        self.assertEqual(response.status_code, 200, response.data)
