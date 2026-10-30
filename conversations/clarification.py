@@ -1,3 +1,4 @@
+from config.policies import render_prompt
 import json
 from zoneinfo import ZoneInfo
 
@@ -16,6 +17,7 @@ from goals.services import (
     normalize_plan_operations, serialize_plan_snapshot,
 )
 from .models import Message
+from .requests import retryable, claim, ensure_current, complete
 
 
 def validate_response(plan, source, payload):
@@ -27,10 +29,10 @@ def validate_response(plan, source, payload):
     if not isinstance(summary, str) or len(summary) > 500:
         raise PlanIterationError('AI returned an invalid summary.')
     changes = payload.get('changes', [])
-    if not isinstance(changes, list) or len(changes) > 10:
-        raise PlanIterationError('Clarification proposals must contain at most ten changes.')
-    if sum(isinstance(op, dict) and op.get('action') == 'ask_question' for op in changes) > 2:
-        raise PlanIterationError('Ask at most two focused questions per turn.')
+    if not isinstance(changes, list) or len(changes) > settings.PLAN_MAX_CLARIFICATION_CHANGES:
+        raise PlanIterationError(f'Clarification proposals must contain at most {settings.PLAN_MAX_CLARIFICATION_CHANGES} changes.')
+    if sum(isinstance(op, dict) and op.get('action') == 'ask_question' for op in changes) > settings.PLAN_MAX_QUESTIONS_PER_TURN:
+        raise PlanIterationError(f'Ask at most {settings.PLAN_MAX_QUESTIONS_PER_TURN} focused questions per turn.')
     for operation in changes:
         if not isinstance(operation, dict) or operation.get('action') not in CONTEXT_ACTIONS:
             raise PlanIterationError('Only clarification changes are supported in this stage.')
@@ -61,15 +63,13 @@ def handle_clarification(plan, conversation, raw_text, *, client_id=None, gatewa
                 assistant = conversation.messages.filter(role='assistant', metadata__request_client_id=str(client_id)).first()
                 if assistant:
                     return existing, assistant, None
-                if existing.metadata.get('ai_status') != 'failed':
+                if not retryable(existing):
                     raise PlanVersionConflict('This message is already being processed.')
                 user_message = existing
         if user_message is None:
             user_message = Message.objects.create(conversation=conversation, role='user', content=raw_text,
                                                   client_id=client_id, metadata={'ai_status': 'pending'})
-        else:
-            user_message.metadata = {**user_message.metadata, 'ai_status': 'pending'}
-            user_message.save(update_fields=['metadata'])
+        claim(user_message)
         snapshot = serialize_plan_snapshot(current)
     # The message and ambition survive failed model requests. No DB locks span AI work.
     try:
@@ -77,7 +77,7 @@ def handle_clarification(plan, conversation, raw_text, *, client_id=None, gatewa
 
         profile = SchedulingPreferences.objects.filter(user_id=plan.user_id).first()
         zone = ZoneInfo(profile.timezone) if profile else ZoneInfo('UTC')
-        history = list(conversation.messages.order_by('-created_at')[:10])
+        history = list(conversation.messages.order_by('-created_at')[:settings.CONVERSATION_HISTORY_LIMIT])
         prompt = json.dumps({
             'current_local_time': timezone.now().astimezone(zone).isoformat(),
             'timezone': str(zone), 'timezone_is_fallback': profile is None,
@@ -91,7 +91,7 @@ def handle_clarification(plan, conversation, raw_text, *, client_id=None, gatewa
         }, ensure_ascii=False)
         gateway = gateway or get_ai_gateway()
         payload = gateway.generate_json(
-            task=AITask.PLAN_ITERATION, prompt=prompt, system_prompt=CLARIFICATION_SYSTEM_PROMPT,
+            task=AITask.PLAN_ITERATION, prompt=prompt, system_prompt=render_prompt(CLARIFICATION_SYSTEM_PROMPT),
             response_schema=CLARIFICATION_SCHEMA, schema_name='ambition_clarification', temperature=0.1,
             max_output_tokens=settings.AI_MAX_OUTPUT_TOKENS, timeout_seconds=settings.AI_REQUEST_TIMEOUT_SECONDS,
             validator=lambda data: validate_response(current, user_message, data),
@@ -103,14 +103,14 @@ def handle_clarification(plan, conversation, raw_text, *, client_id=None, gatewa
             fresh = Plan.objects.select_for_update().get(pk=plan.pk)
             if fresh.version != current.version:
                 raise PlanVersionConflict('Context changed while Yiyara responded. Retry with the latest plan.')
+            ensure_current(user_message)
             change = create_plan_change(fresh, None, payload['summary'], payload['changes'])
             metadata = {'request_client_id': str(client_id) if client_id else None}
             if change:
                 metadata['change'] = {'id': str(change.pk), 'status': change.status, 'summary': change.summary,
                                       'operations': change.operations, 'base_version': change.base_version}
             assistant = Message.objects.create(conversation=conversation, role='assistant', content=payload['reply'], metadata=metadata)
-            user_message.metadata = {**user_message.metadata, 'ai_status': 'completed'}
-            user_message.save(update_fields=['metadata'])
+            complete(user_message)
         return user_message, assistant, change
     except (AIConfigurationError, PlanIterationError, PlanVersionConflict):
         _mark_message_failed(user_message)

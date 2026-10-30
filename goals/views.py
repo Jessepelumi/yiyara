@@ -1,22 +1,18 @@
 from rest_framework.views import APIView
 from rest_framework.generics import ListAPIView, RetrieveAPIView
 from rest_framework.response import Response
-from rest_framework.throttling import ScopedRateThrottle
 from django.shortcuts import get_object_or_404
 from django.db import transaction
 from django.db.models.deletion import RestrictedError
 from django.db.models import Count
 from rest_framework import status, permissions
-from workflow import ai_engine
+from rest_framework.exceptions import ValidationError as ApiValidationError
 from .serializers import (
-    DecomposeGoalRequestSerializer,
-    GoalDecompositionSerializer,
     GoalSerializer,
     PlanChangeSerializer,
     PlanRevisionSerializer,
     PlanSerializer,
     PlanSummarySerializer,
-    PreviewPlanSerializer,
     AmbitionSerializer,
 )
 from .models import Goal, Plan, PlanChange, PlanRevision
@@ -28,106 +24,6 @@ from .services import (
 import logging
 
 logger = logging.getLogger(__name__)
-
-
-class PreviewDecomposeGoalView(APIView):
-    """Generate a validated goal preview without creating database records."""
-
-    permission_classes = [permissions.AllowAny]
-    throttle_classes = [ScopedRateThrottle]
-    throttle_scope = "goal_preview"
-
-    def post(self, request):
-        request_serializer = DecomposeGoalRequestSerializer(data=request.data)
-        request_serializer.is_valid(raise_exception=True)
-        raw_input = request_serializer.validated_data["text"]
-
-        try:
-            workflow = ai_engine.YiyaraWorkflow()
-            goal_data = workflow.decompose_goal(raw_input)
-            preview = {
-                "title": raw_input[:255],
-                "raw_input": raw_input,
-                "goals": goal_data,
-            }
-            response_serializer = PreviewPlanSerializer(preview)
-            return Response(response_serializer.data, status=status.HTTP_200_OK)
-        except ai_engine.AIConfigurationError as exc:
-            return Response(
-                {"error": "ai_not_configured", "message": str(exc)},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-        except ai_engine.GoalDecompositionError as exc:
-            logger.warning("Anonymous goal preview failed: %s", exc)
-            return Response(
-                {"error": "goal_decomposition_failed", "message": str(exc)},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-        except Exception:
-            logger.exception("Unexpected anonymous goal preview failure")
-            return Response(
-                {
-                    "error": "goal_decomposition_failed",
-                    "message": "Unexpected server error",
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-
-class DecomposeGoalView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request):
-        request_serializer = DecomposeGoalRequestSerializer(data=request.data)
-        request_serializer.is_valid(raise_exception=True)
-        raw_input = request_serializer.validated_data["text"]
-
-        try:
-            workflow = ai_engine.YiyaraWorkflow()
-            plan = workflow.create_plan_from_ai(request.user, raw_input)
-            serializer = PlanSerializer(plan)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-
-        except ai_engine.AIConfigurationError as exc:
-            return Response(
-                {"error": "ai_not_configured", "message": str(exc)},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-        except ai_engine.GoalDecompositionError as exc:
-            logger.warning(
-                "Goal decomposition failed for user %s: %s", request.user.id, exc
-            )
-            return Response(
-                {"error": "goal_decomposition_failed", "message": str(exc)},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-        except Exception:
-            logger.exception(
-                "Unexpected goal decomposition failure for user %s", request.user.id
-            )
-            return Response(
-                {
-                    "error": "goal_decomposition_failed",
-                    "message": "Unexpected server error",
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-
-class ImportPreviewPlanView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request):
-        serializer = PreviewPlanSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-        plan = ai_engine.YiyaraWorkflow.persist_plan(
-            request.user,
-            data["raw_input"],
-            data["goals"],
-            title=data["title"],
-        )
-        return Response(PlanSerializer(plan).data, status=status.HTTP_201_CREATED)
 
 
 class GoalListView(ListAPIView):
@@ -178,12 +74,16 @@ class DeleteGoalView(APIView):
                         },
                         status=status.HTTP_400_BAD_REQUEST,
                     )
+                from tasks.guards import ensure_goal_editable
+                ensure_goal_editable(goal)
                 title = goal.title
                 goal.delete()
                 plan.version += 1
                 plan.save(update_fields=["version", "updated_at"])
                 create_plan_revision(plan, f'Deleted goal "{title}"')
             return Response(status=status.HTTP_204_NO_CONTENT)
+        except ApiValidationError:
+            raise
         except RestrictedError:
             return Response(
                 {'error': 'task_dependencies', 'message': 'Other tasks depend on this goal. Update their prerequisites first.'},

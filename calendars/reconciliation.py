@@ -1,4 +1,5 @@
 """Read external changes without overwriting Google or inferring task progress."""
+from django.conf import settings
 import copy
 from datetime import timedelta
 
@@ -101,10 +102,10 @@ def observe(user, session_id, expected, code, event, *, allow_change=None):
                     else:
                         session.event_payload.pop(key, None)
                 profile = SchedulingPreferences.objects.filter(user=user).first()
-                bounded = timedelta(minutes=5) <= right - left <= timedelta(minutes=480)
+                bounded = timedelta(minutes=settings.MIN_SESSION_MINUTES) <= right - left <= timedelta(minutes=settings.MAX_SESSION_MINUTES)
                 windows = permitted_windows(user, left, right) if profile and bounded else None
                 if not bounded:
-                    issues.append('unsupported_duration: external session is outside the supported 5–480 minute range')
+                    issues.append(f'unsupported_duration: external session is outside {settings.MIN_SESSION_MINUTES}–{settings.MAX_SESSION_MINUTES} minutes')
                 elif windows is None:
                     issues.append('missing_preferences: set scheduling preferences before evaluating this external time')
                 elif not any(a <= left and b >= right for a, b in windows):
@@ -113,6 +114,15 @@ def observe(user, session_id, expected, code, event, *, allow_change=None):
                 due = sessions.deadline(task, profile) if task and profile else None
                 if due and right > due:
                     issues.append('after_deadline: external time ends after the task or goal deadline')
+                if task and profile and bounded:
+                    from goals.scheduling import apply_windows
+                    try:
+                        ambition_windows = apply_windows(task.goal.plan, profile, left, right, windows or [])
+                        if not any(a <= left and b >= right for a, b in ambition_windows):
+                            issues.append('outside_ambition_rules: external time violates confirmed ambition timing')
+                    except APIException:
+                        issues.append('ambition_rules_pending: confirm the saved ambition timing before relying on this session')
+
                 if changed_time:
                     # Prior overlap consent belongs to its original time, never a new Google time.
                     session.conflicts, session.conflict_token, session.overlap_approved = [], '', False

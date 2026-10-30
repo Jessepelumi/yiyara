@@ -4,34 +4,6 @@ from .models import Goal, Plan, PlanChange, PlanRevision, PlanQuestion
 from tasks.serializers import TaskSerializers
 
 
-class TaskDecompositionSerializer(serializers.Serializer):
-    title = serializers.CharField(max_length=255, trim_whitespace=True)
-    description = serializers.CharField(required=False, allow_blank=True, default="")
-    due_date = serializers.DateField(required=False, allow_null=True, default=None)
-
-
-class GoalDecompositionSerializer(serializers.Serializer):
-    title = serializers.CharField(max_length=255, trim_whitespace=True)
-    description = serializers.CharField(required=False, allow_blank=True, default="")
-    due_date = serializers.DateField(required=False, allow_null=True, default=None)
-    tasks = TaskDecompositionSerializer(many=True, allow_empty=False, max_length=50)
-
-    def validate(self, attrs):
-        goal_due_date = attrs.get("due_date")
-        if goal_due_date:
-            for task in attrs["tasks"]:
-                task_due_date = task.get("due_date")
-                if task_due_date and task_due_date > goal_due_date:
-                    raise serializers.ValidationError(
-                        "Task due dates cannot be later than the goal due date."
-                    )
-        return attrs
-
-
-class DecomposeGoalRequestSerializer(serializers.Serializer):
-    text = serializers.CharField(max_length=10_000, trim_whitespace=True)
-
-
 class GoalSerializer(serializers.ModelSerializer):
     tasks = TaskSerializers(many=True, read_only=True)
     plan_id = serializers.UUIDField(read_only=True)
@@ -65,6 +37,7 @@ class PlanSerializer(serializers.ModelSerializer):
     goals = GoalSerializer(many=True, read_only=True)
     conversation_id = serializers.SerializerMethodField()
     questions = PlanQuestionSerializer(many=True, read_only=True)
+    scheduling_rules_review_required = serializers.SerializerMethodField()
 
     class Meta:
         model = Plan
@@ -79,8 +52,12 @@ class PlanSerializer(serializers.ModelSerializer):
             "goals",
             "created_at",
             "updated_at",
-            "planning_mode", "planning_state", "context", "context_provenance", "waiting_reason", "questions",
+            "planning_mode", "planning_state", "context", "context_provenance", "waiting_reason", "questions", "scheduling_rules_review_required",
         ]
+
+    def get_scheduling_rules_review_required(self, obj):
+        from .scheduling import needs_review
+        return needs_review(obj)
 
     def get_conversation_id(self, obj):
         try:
@@ -112,12 +89,6 @@ class PlanSummarySerializer(serializers.ModelSerializer):
     def get_first_goal_id(self, obj):
         goal = obj.goals.order_by("created_at").only("id").first()
         return goal.id if goal else None
-
-
-class PreviewPlanSerializer(serializers.Serializer):
-    title = serializers.CharField(max_length=255)
-    raw_input = serializers.CharField()
-    goals = GoalDecompositionSerializer(many=True)
 
 
 class PlanChangeSerializer(serializers.ModelSerializer):

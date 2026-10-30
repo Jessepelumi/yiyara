@@ -1,29 +1,20 @@
 from django.urls import path
-from .planning_views import PlanContextView, QuestionAnswerView, TaskPlanProposalView, ReplanProposalView
+from .planning_views import PlanContextView, QuestionAnswerView, TaskPlanProposalView, ReplanProposalView, UpgradeLegacyPlanView
 from .views import (
-    DecomposeGoalView,
     DeleteGoalView,
     GoalListView,
-    ImportPreviewPlanView,
     PlanChangeListView,
     PlanDetailView,
     PlanListView,
     PlanRevisionListView,
-    PreviewDecomposeGoalView,
     RestorePlanRevisionView,
 )
 
 urlpatterns = [
-    path('decompose/preview/', PreviewDecomposeGoalView.as_view(), name='preview-decompose-goal'),
-    path('decompose/', DecomposeGoalView.as_view(), name='decompose-goal'),
     path('list/', GoalListView.as_view(), name="goal-list"),
     path('plans/', PlanListView.as_view(), name="plan-list"),
-    path(
-        'plans/import-preview/',
-        ImportPreviewPlanView.as_view(),
-        name="import-preview-plan",
-    ),
     path('plans/<uuid:plan_id>/', PlanDetailView.as_view(), name="plan-detail"),
+    path('plans/<uuid:plan_id>/upgrade/', UpgradeLegacyPlanView.as_view(), name='plan-upgrade'),
     path('plans/<uuid:plan_id>/context/', PlanContextView.as_view(), name="plan-context"),
     path('plans/<uuid:plan_id>/tasks/propose/', TaskPlanProposalView.as_view(), name="plan-tasks-propose"),
     path('plans/<uuid:plan_id>/replan/', ReplanProposalView.as_view(), name="plan-replan"),

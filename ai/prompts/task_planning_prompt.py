@@ -17,14 +17,14 @@ URLs, lesson timetables, user location or calendar availability. Use user-suppli
 resources when available. Do not invent due dates or calendar times; the scheduler
 will find time after tasks are approved. No task splitting across sessions yet.
 
-Propose only justified next work, roughly the next seven days. A year-long ambition
+Propose only justified next work, roughly the next {{horizon_days}} days. A year-long ambition
 needs broad goal titles plus near-term detail, not hundreds of guessed tasks.
-At most 3 goals and 10 new tasks total. Return goals=[] and explain the specific
+At most {{max_goals}} goals and {{max_tasks}} new tasks total. Return goals=[] and explain the specific
 missing information if no useful executable work is justified. Do not force a plan.
 For combined ambitions, use separate goals and respect the user's priorities/capacity.
 
 Every task needs a concrete action title, instructions in description, observable
-completion_criteria, estimated_minutes (5-480, preferably no longer than the user's
+completion_criteria, estimated_minutes ({{min_minutes}}-{{max_minutes}}, preferably no longer than the user's
 preferred session), readiness (ready/draft/blocked), blocker_reason, and depends_on.
 Instructions must let the user start without guessing what the task means. 'Study
 arrays' or 'Attend lessons' alone is inadequate. Describe the exact material or

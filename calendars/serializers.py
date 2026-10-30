@@ -1,3 +1,5 @@
+from django.conf import settings
+from config.policies import EffortField
 from datetime import timedelta
 
 from rest_framework import serializers
@@ -29,8 +31,8 @@ class AvailabilitySerializer(serializers.Serializer):
 
     def validate(self, attrs):
         duration = attrs["time_max"] - attrs["time_min"]
-        if duration <= timedelta(0) or duration > timedelta(days=31):
-            raise serializers.ValidationError("Choose a positive range of at most 31 days.")
+        if duration <= timedelta(0) or duration > timedelta(days=settings.SCHEDULE_MAX_RANGE_DAYS):
+            raise serializers.ValidationError(f"Choose a positive range of at most {settings.SCHEDULE_MAX_RANGE_DAYS} days.")
         return attrs
 
 
@@ -56,7 +58,7 @@ class WorkingHoursSerializer(serializers.Serializer):
 class SchedulingPreferencesSerializer(serializers.Serializer):
     timezone = serializers.CharField(max_length=100)
     working_hours = WorkingHoursSerializer(many=True, allow_empty=True, max_length=50)
-    preferred_session_minutes = serializers.IntegerField(min_value=5, max_value=480, default=60)
+    preferred_session_minutes = EffortField(default=60)
 
     def validate_timezone(self, value):
         from zoneinfo import ZoneInfo, ZoneInfoNotFoundError

@@ -4,6 +4,8 @@ from django.shortcuts import get_object_or_404
 from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.throttling import ScopedRateThrottle
+from .requests import retryable
 
 from ai.providers.base import AIConfigurationError
 from goals.models import Plan, PlanChange
@@ -23,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 
 class PlanMessagesView(APIView):
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "plan_chat"
     permission_classes = [permissions.IsAuthenticated]
 
     def get_plan(self, request, plan_id):
@@ -75,7 +79,7 @@ class PlanMessagesView(APIView):
                     role=Message.Role.ASSISTANT,
                     metadata__request_client_id=str(client_id),
                 ).first()
-                if existing.metadata.get("ai_status") != "failed" or assistant:
+                if assistant:
                     return Response(
                         {
                             "conversation_id": conversation.id,
@@ -87,9 +91,13 @@ class PlanMessagesView(APIView):
                                 ],
                                 many=True,
                             ).data,
-                            "change": None,
+                            "change": PlanChangeSerializer(plan.changes.get(pk=(assistant.metadata.get('change_id') or assistant.metadata.get('change', {}).get('id')))).data
+                                if (assistant.metadata.get('change_id') or assistant.metadata.get('change', {}).get('id')) else None,
                         }
                     )
+
+                if not retryable(existing):
+                    return Response({'error': 'request_in_progress', 'message': 'This request is still processing. Retry the same client_id shortly.'}, status=409)
 
         if requested_version and requested_version != plan.version:
             return Response(

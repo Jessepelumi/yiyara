@@ -111,3 +111,26 @@ class TaskPlanProposalView(APIView):
 
 class ReplanProposalView(TaskPlanProposalView):
     replanning = True
+
+
+class UpgradeLegacyPlanView(APIView):
+    def post(self, request, plan_id):
+        from tasks.guards import ensure_goal_editable
+        with transaction.atomic():
+            get_user_model().objects.select_for_update().get(pk=request.user.pk)
+            plan = get_object_or_404(Plan.objects.select_for_update(), pk=plan_id, user=request.user)
+            if plan.planning_mode == 'contextual':
+                return Response(PlanSerializer(plan).data)
+            for goal in plan.goals.all():
+                ensure_goal_editable(goal)
+            plan.planning_mode, plan.planning_state = 'contextual', 'clarifying'
+            plan.context = {'desired_outcome': plan.raw_input, 'starting_point': '', 'timing': '', 'constraints': [], 'assumptions': []}
+            plan.context_provenance = {}
+            plan.waiting_reason = ''
+            from tasks.models import Task
+            Task.objects.filter(goal__plan=plan).update(planning_context_version=plan.context_version)
+            plan.context_version += 1
+            plan.version += 1
+            plan.save()
+            create_plan_revision(plan, 'Upgraded legacy board to contextual planning; tasks require review')
+        return Response(PlanSerializer(plan).data)

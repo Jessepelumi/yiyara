@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from rest_framework import permissions
@@ -39,7 +40,15 @@ class CallbackView(CalendarView):
             if len(request.query_params.getlist(key)) > 1:
                 raise ValidationError("Duplicate authorization parameters.")
         services.finish(request.query_params)
-        return Response({"connected": True, "detail": "Calendar connected. Return to Postman."})
+        if settings.FRONTEND_URL:
+            from django.http import HttpResponseRedirect
+            from django.core.exceptions import ImproperlyConfigured
+            from urllib.parse import urlsplit
+            origin = urlsplit(settings.FRONTEND_URL)
+            if origin.scheme not in ('http', 'https') or origin.username or origin.password or not origin.netloc:
+                raise ImproperlyConfigured('FRONTEND_URL must be an absolute HTTP(S) URL without credentials.')
+            return HttpResponseRedirect(settings.FRONTEND_URL)
+        return Response({"connected": True, "detail": "Calendar connected. You may close this window."})
 
 
 class ConnectionView(CalendarView):

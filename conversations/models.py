@@ -58,6 +58,8 @@ class Message(models.Model):
     )
     metadata = models.JSONField(default=dict, blank=True)
     client_id = models.UUIDField(null=True, blank=True)
+    ai_attempt = models.UUIDField(null=True, editable=False)
+    ai_lease_until = models.DateTimeField(null=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

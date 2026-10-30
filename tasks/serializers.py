@@ -1,3 +1,5 @@
+from django.conf import settings
+from config.policies import EffortField, valid_effort
 from rest_framework import serializers
 from .models import Task
 
@@ -23,7 +25,7 @@ class TaskSerializers(serializers.ModelSerializer):
 
 
 class TaskWriteSerializer(TaskSerializers):
-    estimated_minutes = serializers.IntegerField(min_value=5, max_value=480, allow_null=True, required=False)
+    estimated_minutes = EffortField(allow_null=True, required=False)
     completion_criteria = serializers.CharField(max_length=5000, allow_blank=True, required=False)
     blocker_reason = serializers.CharField(max_length=2000, allow_blank=True, required=False)
     dependency_ids = serializers.ListField(child=serializers.UUIDField(), max_length=50, required=False, write_only=True)
@@ -61,7 +63,7 @@ class TaskWriteSerializer(TaskSerializers):
             return attrs.get(name, getattr(self.instance, name, default))
 
         if value('readiness', 'draft') == 'ready' and (
-            not (self.instance.effective_minutes if self.instance and self.instance.remaining_minutes is not None else value('estimated_minutes'))
+            not valid_effort(self.instance.effective_minutes if self.instance and self.instance.remaining_minutes is not None else value('estimated_minutes'))
             or not value('completion_criteria', '').strip()
         ):
             raise serializers.ValidationError('Ready tasks require estimated_minutes and completion_criteria.')

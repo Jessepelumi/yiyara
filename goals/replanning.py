@@ -1,4 +1,6 @@
 """Reviewable edits and additions; task outcomes and external events stay immutable."""
+from django.conf import settings
+from config.policies import EffortField
 import json
 import re
 import uuid
@@ -21,7 +23,7 @@ class RevisionFieldsSerializer(StrictSerializer):
     title = serializers.CharField(max_length=255, required=False)
     description = serializers.CharField(max_length=5000, required=False)
     completion_criteria = serializers.CharField(max_length=3000, required=False)
-    estimated_minutes = serializers.IntegerField(min_value=5, max_value=480, allow_null=True, required=False)
+    estimated_minutes = EffortField(allow_null=True, required=False)
     readiness = serializers.ChoiceField(choices=['ready', 'draft', 'blocked'], required=False)
     blocker_reason = serializers.CharField(max_length=2000, allow_blank=True, required=False)
     depends_on = serializers.ListField(child=serializers.CharField(max_length=64), max_length=50, required=False)
@@ -58,15 +60,15 @@ def normalize_replan(plan, operation):
     ensure_plannable(plan)
     if operation.get('context_version') != plan.context_version:
         raise serializers.ValidationError('Planning context changed; request a new replanning proposal.')
-    updates = RevisionSerializer(data=operation.get('updates'), many=True, max_length=10)
+    updates = RevisionSerializer(data=operation.get('updates'), many=True, max_length=settings.PLAN_MAX_TASKS_PER_PROPOSAL)
     updates.is_valid(raise_exception=True)
-    goals = ProposedGoalSerializer(data=operation.get('goals'), many=True, max_length=3)
+    goals = ProposedGoalSerializer(data=operation.get('goals'), many=True, max_length=settings.PLAN_MAX_GOALS_PER_PROPOSAL)
     goals.is_valid(raise_exception=True)
     updates, goals = updates.validated_data, goals.validated_data
     if not updates and not goals:
         raise serializers.ValidationError('There is no work to revise or add.')
-    if len(updates) + sum(len(goal['tasks']) for goal in goals) > 10:
-        raise serializers.ValidationError('Revise or add at most ten tasks in one proposal.')
+    if len(updates) + sum(len(goal['tasks']) for goal in goals) > settings.PLAN_MAX_TASKS_PER_PROPOSAL:
+        raise serializers.ValidationError(f'Revise or add at most {settings.PLAN_MAX_TASKS_PER_PROPOSAL} tasks in one proposal.')
     task_ids = [str(item['task_id']) for item in updates]
     if len(set(task_ids)) != len(task_ids):
         raise serializers.ValidationError('Group changes for the same task together.')

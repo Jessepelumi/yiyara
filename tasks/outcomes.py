@@ -1,4 +1,6 @@
 """User-reported progress, independent of Google event publication and AI inference."""
+from django.conf import settings
+from config.policies import valid_effort
 import uuid
 
 from django.db import transaction
@@ -22,7 +24,7 @@ class OutcomeRequestSerializer(serializers.Serializer):
     plan_version = serializers.IntegerField(min_value=1)
     status = serializers.ChoiceField(choices=['completed', 'partial', 'blocked', 'skipped', 'reopened'])
     notes = serializers.CharField(max_length=10000, allow_blank=True, default='')
-    remaining_minutes = serializers.IntegerField(min_value=0, max_value=480, allow_null=True, default=None)
+    remaining_minutes = serializers.IntegerField(min_value=0, max_value=None, allow_null=True, default=None)
     spent_minutes = serializers.IntegerField(min_value=0, max_value=1440, allow_null=True, default=None)
     blocker_reason = serializers.CharField(max_length=2000, allow_blank=True, default='')
     session_id = serializers.UUIDField(allow_null=True, default=None)
@@ -38,10 +40,10 @@ class OutcomeRequestSerializer(serializers.Serializer):
             if remaining not in (None, 0):
                 raise serializers.ValidationError('Completed work must have zero remaining minutes.')
             attrs['remaining_minutes'] = 0
-        elif status in ('partial', 'reopened') and (remaining is None or remaining < 5):
-            raise serializers.ValidationError('Partial or reopened work needs 5–480 remaining minutes.')
-        elif remaining is not None and remaining < 5:
-            raise serializers.ValidationError('Unfinished work needs 5–480 remaining minutes, or null if unknown.')
+        elif status in ('partial', 'reopened') and (not valid_effort(remaining)):
+            raise serializers.ValidationError(f'Partial or reopened work needs {settings.MIN_SESSION_MINUTES}–{settings.MAX_SESSION_MINUTES} remaining minutes.')
+        elif remaining is not None and not valid_effort(remaining):
+            raise serializers.ValidationError(f'Use {settings.MIN_SESSION_MINUTES}–{settings.MAX_SESSION_MINUTES} remaining minutes, or null if unknown.')
         if status == 'blocked' and not attrs['blocker_reason'].strip():
             raise serializers.ValidationError('Explain what is blocking this task.')
         if status != 'blocked' and attrs['blocker_reason']:
@@ -69,7 +71,7 @@ def apply_report(task, data):
         task.readiness = 'draft'
     else:
         effort = task.remaining_minutes if task.remaining_minutes is not None else task.estimated_minutes
-        task.readiness = 'ready' if task.completion_criteria.strip() and effort and 5 <= effort <= 480 else 'draft'
+        task.readiness = 'ready' if task.completion_criteria.strip() and effort and valid_effort(effort) else 'draft'
     task.save(update_fields=[*progress_state(task), 'updated_at'])
 
 
@@ -129,7 +131,7 @@ def record_completion_toggle(task, plan, completed):
     """Keep the existing PATCH/apply completion controls compatible and auditable."""
     if task.is_completed == completed:
         return
-    remaining = None if completed else (task.estimated_minutes if task.estimated_minutes and task.estimated_minutes >= 5 else None)
+    remaining = None if completed else (task.estimated_minutes if task.estimated_minutes and valid_effort(task.estimated_minutes) else None)
     # Legacy draft tasks may have no effort yet; they remain unschedulable.
     status = 'completed' if completed else 'reopened'
     append_report(task, plan, {

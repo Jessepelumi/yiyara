@@ -1,4 +1,6 @@
 """Dependency integrity and the common scheduling gate for all task sources."""
+from django.conf import settings
+from config.policies import valid_effort
 from rest_framework.exceptions import ValidationError
 
 from .models import Task, TaskDependency
@@ -46,11 +48,11 @@ def replace_dependencies(task, ids):
     TaskDependency.objects.bulk_create([TaskDependency(task=task, prerequisite_id=pk) for pk in ids])
 
 
-def scheduling_blockers(task):
+def scheduling_blockers(task, *, include_sessions=True):
     blockers = []
-    if task.is_completed or task.goal.is_completed or task.goal.plan.status != 'active':
+    if task.is_completed or task.goal.is_completed or task.goal.plan.status != 'active' or task.goal.plan.planning_state == 'completed':
         blockers.append('Task or goal is complete, or its plan is inactive.')
-    if task.readiness != 'ready' or not task.completion_criteria.strip() or not task.effective_minutes or not 5 <= task.effective_minutes <= 480:
+    if task.readiness != 'ready' or not task.completion_criteria.strip() or not task.effective_minutes or not valid_effort(task.effective_minutes):
         blockers.append('Task needs ready status, effort and completion criteria.')
     if task.progress_status == 'skipped':
         blockers.append('Task was skipped. Explicitly reopen it before scheduling.')
@@ -60,4 +62,11 @@ def scheduling_blockers(task):
         blockers.append('One or more prerequisite tasks are incomplete.')
     if task.planning_context_version is not None and task.planning_context_version != task.goal.plan.context_version:
         blockers.append('Planning context changed. Review the task and explicitly mark it ready again.')
+    from goals.scheduling import needs_review
+    if needs_review(task.goal.plan):
+        blockers.append('Confirm scheduling_rules for saved timing and constraints before scheduling.')
+    if include_sessions:
+        from .guards import active_sessions
+        if active_sessions(task).exists():
+            blockers.append('This task already has an unfinished committed session.')
     return blockers

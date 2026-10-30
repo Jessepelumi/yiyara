@@ -1,3 +1,4 @@
+from django.conf import settings
 from datetime import date
 
 from django.core.exceptions import ValidationError
@@ -73,7 +74,7 @@ def serialize_plan_snapshot(plan):
             {"id": str(item.pk), "task_id": str(item.task_id), "status": item.status, "notes": item.notes,
              "remaining_minutes": item.remaining_minutes, "spent_minutes": item.spent_minutes,
              "blocker_reason": item.blocker_reason, "created_at": item.created_at.isoformat()}
-            for item in plan.task_outcomes.all()[:50]
+            for item in plan.task_outcomes.all()[:settings.OUTCOME_HISTORY_LIMIT]
         ],
         "goals": goals,
     }
@@ -145,8 +146,8 @@ def _task_payload(payload, *, goal_due_date=None):
 
 def normalize_plan_operations(plan, operations):
     from .planning import CONTEXT_ACTIONS, normalize_context_operation
-    if not isinstance(operations, list) or len(operations) > 25:
-        raise InvalidPlanOperation("Changes must contain no more than 25 operations")
+    if not isinstance(operations, list) or len(operations) > settings.PLAN_MAX_CHANGE_OPERATIONS:
+        raise InvalidPlanOperation(f"Changes must contain no more than {settings.PLAN_MAX_CHANGE_OPERATIONS} operations")
 
     normalized = []
     if any(isinstance(op, dict) and op.get('action') in ('add_task_batch', 'replan_tasks') for op in operations) and len(operations) != 1:
@@ -202,14 +203,20 @@ def normalize_plan_operations(plan, operations):
             due_date = _parse_date(operation.get("due_date"), "Goal due date")
             clean["due_date"] = due_date.isoformat() if due_date else None
             tasks = operation.get("tasks", [])
-            if not isinstance(tasks, list) or len(tasks) > 50:
-                raise InvalidPlanOperation("A goal can contain no more than 50 tasks")
+            if not isinstance(tasks, list) or len(tasks) > settings.PLAN_MAX_TASKS_PER_PROPOSAL:
+                raise InvalidPlanOperation(f"A proposal can add at most {settings.PLAN_MAX_TASKS_PER_PROPOSAL} tasks")
             clean["tasks"] = [
                 _task_payload(task, goal_due_date=due_date) for task in tasks
             ]
 
         elif action in {"update_goal", "delete_goal", "add_task"}:
             goal = _goal_for_plan(plan, operation.get("goal_id"))
+            if action in ('update_goal', 'delete_goal'):
+                from tasks.guards import ensure_goal_editable
+                try:
+                    ensure_goal_editable(goal)
+                except ApiValidationError as exc:
+                    raise InvalidPlanOperation(str(exc.detail)) from exc
             clean["goal_id"] = str(goal.id)
 
             if action == "update_goal":
@@ -251,6 +258,11 @@ def normalize_plan_operations(plan, operations):
             task = _task_for_plan(plan, operation.get("task_id"))
             if action == 'delete_task' and task.dependents.exists():
                 raise InvalidPlanOperation('Other tasks depend on this task; update their prerequisites before deleting it.')
+            from tasks.guards import ensure_editable
+            try:
+                ensure_editable(task, None if action == 'delete_task' else set(operation) - {'action', 'task_id'})
+            except ApiValidationError as exc:
+                raise InvalidPlanOperation(str(exc.detail)) from exc
             clean["task_id"] = str(task.id)
 
             if action == "update_task":
@@ -283,6 +295,10 @@ def normalize_plan_operations(plan, operations):
 
         normalized.append(clean)
 
+    legacy_goals = [op for op in normalized if op['action'] == 'add_goal']
+    added_tasks = sum(len(op.get('tasks', [])) for op in legacy_goals) + sum(op['action'] == 'add_task' for op in normalized)
+    if len(legacy_goals) > settings.PLAN_MAX_GOALS_PER_PROPOSAL or added_tasks > settings.PLAN_MAX_TASKS_PER_PROPOSAL:
+        raise InvalidPlanOperation('Changes exceed the configured proposal limits.')
     return normalized
 
 

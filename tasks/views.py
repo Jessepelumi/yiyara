@@ -41,9 +41,8 @@ class TaskDetailView(CalendarView):
             lock_user(request.user)
             task = get_object_or_404(Task.objects.select_related('goal'), pk=task_id, goal__user=request.user)
             plan = Plan.objects.select_for_update().get(pk=task.goal.plan_id)
-            if WorkSession.objects.filter(user=request.user, task_snapshot__task_id=str(task.pk), finished_at__isnull=True, status__in=['publishing', 'published']).exists():
-                if set(request.data) - {'is_completed'}:
-                    raise ValidationError('Only completion may change after publishing starts; event editing is not supported yet.')
+            from .guards import ensure_editable
+            ensure_editable(task, request.data)
             serializer = TaskWriteSerializer(task, data=request.data, partial=True, context={'goal': task.goal})
             serializer.is_valid(raise_exception=True)
             completed = serializer.validated_data.pop('is_completed', None)

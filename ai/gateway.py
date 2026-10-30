@@ -27,7 +27,6 @@ T = TypeVar("T")
 
 
 class AITask(StrEnum):
-    GOAL_DECOMPOSITION = "goal_decomposition"
     PLAN_ITERATION = "plan_iteration"
     TASK_PLANNING = "task_planning"
 

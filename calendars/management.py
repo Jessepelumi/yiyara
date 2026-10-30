@@ -1,4 +1,5 @@
 """Reviewable changes to existing events, with durable intent and conditional writes."""
+from django.conf import settings
 import copy
 import uuid
 from datetime import datetime, time, timedelta
@@ -83,7 +84,7 @@ def event_summary(event):
 
 
 def editable_task(session, saved=None):
-    if not timedelta(minutes=5) <= session.ends_at - session.starts_at <= timedelta(minutes=480):
+    if not timedelta(minutes=settings.MIN_SESSION_MINUTES) <= session.ends_at - session.starts_at <= timedelta(minutes=settings.MAX_SESSION_MINUTES):
         raise Conflict('External session duration is unsupported. Correct it in Google or cancel the session.')
     task = Task.objects.select_related('goal__plan').filter(pk=session.task_id, goal__user_id=session.user_id).first()
     if not task:
@@ -139,6 +140,10 @@ def availability(user, session, start, end, exclude_change=None):
         {'calendar_id': session.destination_calendar, 'start': left, 'end': right}
         for left, right in destination_busy(user, session, start, end)]
     allowed, local_busy = conflicts.local_availability(user, start, end, exclude_sessions=[session.pk], exclude_change=exclude_change)
+    from goals.scheduling import apply_windows
+    task = Task.objects.select_related('goal__plan').get(pk=session.task_id)
+    profile = SchedulingPreferences.objects.get(user=user)
+    allowed = apply_windows(task.goal.plan, profile, start, end, allowed)
     return allowed, [*busy, *local_busy]
 
 
@@ -232,7 +237,7 @@ def propose(user, session_id, kind, data):
         if old:
             old.status = 'rejected'
             old.save(update_fields=['status'])
-        expiry = min(timezone.now() + timedelta(hours=24), left) if left else timezone.now() + timedelta(hours=24)
+        expiry = min(timezone.now() + timedelta(seconds=settings.PROPOSAL_TTL_SECONDS), left) if left else timezone.now() + timedelta(seconds=settings.PROPOSAL_TTL_SECONDS)
         change = SessionChange.objects.create(session=session, user=user, client_id=data['client_id'], kind=kind,
             base_version=version, request_data=canonical, before_event={'missing': True} if gone else event_summary(event),
             task_snapshot=saved, starts_at=left, ends_at=right, expires_at=expiry, conflicts=occupied,
@@ -395,7 +400,7 @@ def approve(user, change_id, *, allow_overlap=False, conflict_token=''):
             raise Conflict('Rejected changes cannot be approved.')
         if change.lease_until and change.lease_until > timezone.now():
             raise Conflict('Approval is already in progress. Retry this same change shortly.')
-        change.attempt, change.lease_until = attempt, timezone.now() + timedelta(minutes=2)
+        change.attempt, change.lease_until = attempt, timezone.now() + timedelta(seconds=settings.CALENDAR_APPROVAL_LEASE_SECONDS)
         change.save(update_fields=['attempt', 'lease_until'])
     try:
         return _approve(user, change_id, attempt, allow_overlap, conflict_token)

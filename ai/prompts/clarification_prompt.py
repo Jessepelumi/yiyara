@@ -10,7 +10,7 @@ locations or availability. No research tools are available. Do not invent dates.
 Use the supplied current local date/time and timezone when interpreting timing.
 Use saved scheduling preferences when provided; do not ask users to repeat their
 general availability. Ambition-specific timing or constraints may still be unknown.
-Ask at most two focused questions per turn, only if answers would change the next
+Ask at most {{max_questions}} focused questions per turn, only if answers would change the next
 useful action. Do not require a deadline, budget or other field for every ambition.
 A broad ambition may need its outcome refined before work can be planned.
 
@@ -21,7 +21,15 @@ Do not say that you saved/updated anything. An empty changes list is fine for ad
 Allowed changes:
 - update_context: desired_outcome, starting_point, timing (strings), constraints and
   assumptions (string arrays), planning_state, waiting_reason; fields are optional.
-  Confirmed field values MUST quote exact passages from the current user message,
+  scheduling_rules may contain not_before/deadline (ISO timestamps with explicit offsets,
+  or null) and working_hours (weekday/start_time/end_time windows, or null).
+  Propose these rules whenever timing or constraints are added/changed, even {} when
+  those statements add no calendar restriction. Show the interpretation in the reply
+  for explicit user approval. Use the supplied timezone; do not guess unknown dates.
+  A null working_hours adds no restriction; [] permits no time. These rules replace
+  earlier ambition rules, so preserve restrictions still applicable. Never silently
+  discard an unresolved calendar constraint; ask instead. Missing normalization
+  blocks scheduling. Confirmed field values MUST quote exact passages from the current user message,
   with source_message_id equal to current_user_message_id. Do not paraphrase facts.
   Context updates append new information to existing memory; use the explicit user
   context-edit endpoint for replacements/corrections. assumptions stay separately
@@ -58,6 +66,12 @@ CLARIFICATION_SCHEMA = {
                 "desired_outcome": {"type": "string"}, "starting_point": {"type": "string"},
                 "timing": {"type": "string"}, "constraints": {"type": "array", "items": {"type": "string"}},
                 "assumptions": {"type": "array", "items": {"type": "string"}},
+                "scheduling_rules": {"type": "object", "properties": {
+                    "not_before": {"type": ["string", "null"]}, "deadline": {"type": ["string", "null"]},
+                    "working_hours": {"type": ["array", "null"], "items": {"type": "object", "properties": {
+                        "weekday": {"type": "integer"}, "start_time": {"type": "string"}, "end_time": {"type": "string"}
+                    }, "required": ["weekday", "start_time", "end_time"]}}
+                }},
                 "planning_state": {"type": "string", "enum": ["clarifying", "actionable", "waiting"]},
                 "waiting_reason": {"type": "string"}, "source_message_id": {"type": "string"},
                 "question_id": {"type": "string"}, "answer": {"type": "string"},

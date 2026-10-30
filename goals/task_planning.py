@@ -1,9 +1,11 @@
 """Bounded task proposals from approved context, using the existing change review API."""
+from config.policies import render_prompt
 import json
 import re
 import uuid
 from zoneinfo import ZoneInfo
 
+from config.policies import EffortField
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
@@ -41,7 +43,7 @@ class ProposedTaskSerializer(StrictSerializer):
     title = serializers.CharField(max_length=255)
     description = serializers.CharField(max_length=5000)
     completion_criteria = serializers.CharField(max_length=3000)
-    estimated_minutes = serializers.IntegerField(min_value=5, max_value=480, allow_null=True)
+    estimated_minutes = EffortField(allow_null=True)
     readiness = serializers.ChoiceField(choices=['ready', 'draft', 'blocked'])
     blocker_reason = serializers.CharField(max_length=2000, allow_blank=True, default='')
     depends_on = serializers.ListField(child=serializers.CharField(max_length=64), max_length=50, default=list)
@@ -60,7 +62,7 @@ class ProposedGoalSerializer(StrictSerializer):
     goal_id = serializers.UUIDField(required=False, allow_null=True, default=None)
     title = serializers.CharField(max_length=255, required=False, allow_blank=True, default='')
     description = serializers.CharField(max_length=4000, required=False, allow_blank=True, default='')
-    tasks = ProposedTaskSerializer(many=True, allow_empty=False, max_length=10)
+    tasks = ProposedTaskSerializer(many=True, allow_empty=False)
 
     def validate(self, attrs):
         if not attrs['goal_id'] and not attrs['title']:
@@ -83,11 +85,11 @@ def normalize_batch(plan, operation, *, existing_graph=None, unfinished_signatur
     ensure_plannable(plan)
     if operation.get('context_version') != plan.context_version:
         raise serializers.ValidationError('Planning context changed; request a new task proposal.')
-    serializer = ProposedGoalSerializer(data=operation.get('goals'), many=True, allow_empty=False, max_length=3)
+    serializer = ProposedGoalSerializer(data=operation.get('goals'), many=True, allow_empty=False, max_length=settings.PLAN_MAX_GOALS_PER_PROPOSAL)
     serializer.is_valid(raise_exception=True)
     goals = serializer.validated_data
-    if sum(len(goal['tasks']) for goal in goals) > 10:
-        raise serializers.ValidationError('Propose at most ten new tasks.')
+    if sum(len(goal['tasks']) for goal in goals) > settings.PLAN_MAX_TASKS_PER_PROPOSAL:
+        raise serializers.ValidationError(f'Propose at most {settings.PLAN_MAX_TASKS_PER_PROPOSAL} new tasks.')
     graph = plan_graph(plan) if existing_graph is None else {node: set(parents) for node, parents in existing_graph.items()}
     keys = [task['key'] for goal in goals for task in goal['tasks']]
     if len(keys) != len(set(keys)):
@@ -204,6 +206,8 @@ def propose_tasks(user, plan_id, data, *, replanning=False):
     from conversations.models import Conversation, Message
     from .services import PlanVersionConflict, create_plan_change, serialize_plan_snapshot
 
+    from conversations.requests import retryable, claim, ensure_current, complete, fail
+
     source = 'task_replanning' if replanning else 'task_planning'
     validate_payload = validate_result
     system_prompt, schema = TASK_PLANNING_SYSTEM_PROMPT, TASK_PLANNING_SCHEMA
@@ -225,7 +229,7 @@ def propose_tasks(user, plan_id, data, *, replanning=False):
             if assistant:
                 change = plan.changes.filter(pk=assistant.metadata.get('change_id')).first()
                 return assistant, change, True
-            if existing.metadata.get('ai_status') != 'failed':
+            if not retryable(existing):
                 raise PlanVersionConflict('Task planning is already in progress. Retry this client_id shortly.')
         if plan.version != data['plan_version']:
             raise PlanVersionConflict('Plan changed. Refresh before requesting tasks.')
@@ -236,8 +240,7 @@ def propose_tasks(user, plan_id, data, *, replanning=False):
                 else 'Propose the next actionable tasks from saved context.'),
             client_id=data['client_id'],
         )
-        message.metadata = {'source': source, 'focus': data['focus'], 'ai_status': 'pending'}
-        message.save(update_fields=['metadata'])
+        claim(message, {'source': source, 'focus': data['focus']})
         captured_version = plan.version
         snapshot = serialize_plan_snapshot(plan)
         if replanning:
@@ -251,13 +254,13 @@ def propose_tasks(user, plan_id, data, *, replanning=False):
         prompt = json.dumps({
             'current_local_time': timezone.now().astimezone(zone).isoformat(), 'timezone': str(zone),
             'timezone_is_fallback': profile is None, 'persistent_plan': snapshot, 'focus': data['focus'],
-            'near_term_horizon_days': 7,
+            'near_term_horizon_days': settings.PLAN_NEAR_TERM_DAYS,
             'scheduling_preferences': {'working_hours': profile.working_hours,
                                        'preferred_session_minutes': profile.preferred_session_minutes} if profile else None,
         }, ensure_ascii=False)
         gateway = get_ai_gateway()
         payload = gateway.generate_json(
-            task=AITask.TASK_PLANNING, prompt=prompt, system_prompt=system_prompt,
+            task=AITask.TASK_PLANNING, prompt=prompt, system_prompt=render_prompt(system_prompt),
             response_schema=schema, schema_name='task_replanning' if replanning else 'next_actionable_tasks', temperature=0.1,
             max_output_tokens=settings.AI_MAX_OUTPUT_TOKENS, timeout_seconds=settings.AI_REQUEST_TIMEOUT_SECONDS,
             validator=lambda result: validate_payload(plan, result),
@@ -269,6 +272,7 @@ def propose_tasks(user, plan_id, data, *, replanning=False):
             if fresh.version != captured_version:
                 raise PlanVersionConflict('Plan changed while tasks were being proposed. Retry with the current version.')
             ensure_plannable(fresh)
+            ensure_current(message)
             operation = {'action': 'replan_tasks' if replanning else 'add_task_batch',
                          'context_version': fresh.context_version, 'goals': payload['goals']}
             if replanning:
@@ -279,14 +283,11 @@ def propose_tasks(user, plan_id, data, *, replanning=False):
                 'source': source, 'request_client_id': str(data['client_id']),
                 'change_id': str(change.pk) if change else None,
             })
-            message.metadata['ai_status'] = 'completed'
-            message.save(update_fields=['metadata'])
+            complete(message)
         return assistant, change, False
     except (AIConfigurationError, PlanVersionConflict):
-        message.metadata['ai_status'] = 'failed'
-        message.save(update_fields=['metadata'])
+        fail(message)
         raise
     except Exception as exc:
-        message.metadata['ai_status'] = 'failed'
-        message.save(update_fields=['metadata'])
+        fail(message)
         raise TaskPlanningError('Task planning failed. Your request is saved; retry the same client_id.') from exc

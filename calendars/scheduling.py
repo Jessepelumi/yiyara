@@ -20,7 +20,7 @@ def subtract_periods(windows, blocks):
     return windows
 
 
-def permitted_windows(user, start, end):
+def permitted_windows(user, start, end, *, working_hours=None):
     """Return exact half-open UTC windows; never assume hours before setup.
 
     Weekly rules have minute precision. Evaluate UTC minutes against local wall
@@ -35,7 +35,7 @@ def permitted_windows(user, start, end):
     periods = list(ProtectedPeriod.objects.filter(user=user))
     weekly = [p for p in periods if p.kind == "weekly"]
     working = {}
-    for window in preferences.working_hours:
+    for window in preferences.working_hours if working_hours is None else working_hours:
         working.setdefault(window["weekday"], []).append((window["start_time"], window["end_time"]))
     start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
     cursor = start.replace(second=0, microsecond=0)

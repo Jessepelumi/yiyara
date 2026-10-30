@@ -1,5 +1,7 @@
 """Persistent clarification state and reviewable, bounded context operations."""
 import copy
+from django.conf import settings
+from .scheduling import SchedulingRulesSerializer, basis
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
@@ -20,6 +22,7 @@ class ContextUpdateSerializer(serializers.Serializer):
     timing = serializers.CharField(max_length=5000, required=False, allow_blank=True)
     constraints = serializers.ListField(child=serializers.CharField(max_length=2000), max_length=30, required=False)
     assumptions = serializers.ListField(child=serializers.CharField(max_length=2000), max_length=30, required=False)
+    scheduling_rules = SchedulingRulesSerializer(required=False)
     planning_state = serializers.ChoiceField(choices=["clarifying", "actionable", "waiting", "completed"], required=False)
     waiting_reason = serializers.CharField(max_length=2000, required=False, allow_blank=True)
 
@@ -71,7 +74,7 @@ def normalize_context_operation(plan, operation):
         serializer.is_valid(raise_exception=True)
         clean.update(serializer.validated_data)
         confirmed = [key for key in ("desired_outcome", "starting_point", "timing", "constraints") if key in clean]
-        if confirmed:
+        if confirmed or "scheduling_rules" in clean:
             source = _source(plan, operation.get("source_message_id"))
             for key in confirmed:
                 values = clean[key] if isinstance(clean[key], list) else [clean[key]]
@@ -113,6 +116,10 @@ def apply_context_update(plan, fields, source=None):
             "source_message_id": str(source.pk) if source and field != "assumptions" else None,
             "source_message_ids": source_ids if field != "assumptions" else [],
         }
+    if 'scheduling_rules' in fields:
+        context['scheduling_rules'] = fields['scheduling_rules']
+        context['scheduling_rules_basis'] = basis(context)
+        provenance['scheduling_rules'] = {'kind': 'user_approved_rules', 'source_message_id': str(source.pk) if source else None}
     plan.context = context
     plan.context_provenance = provenance
     for field in ("planning_state", "waiting_reason"):
@@ -174,7 +181,7 @@ def apply_context_operation(plan, operation):
     elif action == "ask_question":
         if plan.questions.filter(text=operation["text"], status="open").exists():
             return
-        if plan.questions.count() >= 100 or plan.questions.filter(status="open").count() >= 10:
+        if plan.questions.count() >= settings.PLAN_MAX_QUESTIONS or plan.questions.filter(status="open").count() >= settings.PLAN_MAX_OPEN_QUESTIONS:
             raise serializers.ValidationError("Question limit reached; resolve existing questions first.")
         PlanQuestion.objects.create(plan=plan, text=operation["text"], field=operation["field"], required=operation["required"])
         if operation["required"] and plan.planning_state in ("actionable", "completed"):
@@ -214,9 +221,5 @@ def create_ambition(user, text, title=None):
         plan.context_provenance = {"desired_outcome": {
             "kind": "user_statement", "source_message_id": str(source.pk), "source_message_ids": [str(source.pk)]}}
         plan.save(update_fields=["context_provenance"])
-        question = PlanQuestion.objects.create(plan=plan, text="Where are you starting from, and what have you already done towards this ambition?",
-                                               field="starting_point")
-        Message.objects.create(conversation=conversation, role="assistant", content=question.text,
-                               metadata={"question_id": str(question.pk)})
         create_plan_revision(plan, "Saved ambition for clarification")
         return plan

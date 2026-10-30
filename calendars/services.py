@@ -69,7 +69,7 @@ def configuration():
 
 def request_json(method, url, **kwargs):
     try:
-        response = httpx.request(method, url, timeout=20, **kwargs)
+        response = httpx.request(method, url, timeout=settings.GOOGLE_REQUEST_TIMEOUT_SECONDS, **kwargs)
         if response.status_code == 204:
             return 204, {}
         payload = response.json()
@@ -146,7 +146,7 @@ def finish(params):
         if code != 200:
             raise ValidationError("Google authorization failed. Start a new connection attempt.")
         try:
-            claims = verify_oauth2_token(tokens.get("id_token", ""), partial(Request(), timeout=20),
+            claims = verify_oauth2_token(tokens.get("id_token", ""), partial(Request(), timeout=settings.GOOGLE_REQUEST_TIMEOUT_SECONDS),
                                          audience=settings.GOOGLE_CALENDAR_CLIENT_ID)
         except (ValueError, GoogleAuthError):
             raise ValidationError("Google identity verification failed.") from None

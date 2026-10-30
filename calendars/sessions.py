@@ -1,4 +1,5 @@
 """Single-session proposals and recoverable, idempotent Calendar publishing."""
+from django.conf import settings
 import uuid
 from datetime import datetime, time, timedelta
 from urllib.parse import quote
@@ -38,7 +39,7 @@ def matches_snapshot(task, saved):
 
 def ready(task):
     from tasks.dependencies import scheduling_blockers
-    blockers = scheduling_blockers(task)
+    blockers = scheduling_blockers(task, include_sessions=False)
     if blockers:
         raise ValidationError({'task': blockers})
 
@@ -125,6 +126,8 @@ def propose(user, task_id, start, end, *, preferred_start=None, conflict_policy=
         if start >= limit:
             raise SessionConflict('The search range is after the task deadline.')
         windows, local_busy = conflicts.local_availability(user, start, limit, exclude_sessions=previous)
+        from goals.scheduling import apply_windows
+        windows = apply_windows(task.goal.plan, preferences, start, limit, windows)
         if preferred_start is not None and preferred_start + duration > limit:
             raise ValidationError('The preferred session must fit within the search range and deadline.')
         slot = conflicts.select_slot(windows, [*busy, *local_busy], duration, preferred=preferred_start, policy=conflict_policy)
@@ -145,7 +148,7 @@ def propose(user, task_id, start, end, *, preferred_start=None, conflict_policy=
         }
         return WorkSession.objects.create(
             id=session_id, user=user, task=task, starts_at=slot[0], ends_at=slot[1],
-            expires_at=min(slot[0], timezone.now() + timedelta(hours=24)), destination_calendar=target,
+            expires_at=min(slot[0], timezone.now() + timedelta(seconds=settings.PROPOSAL_TTL_SECONDS)), destination_calendar=target,
             google_sub=subject, google_event_id=event_id, task_snapshot=original, event_payload=payload,
             continuation_of=prior, source_outcome_id=latest.pk if prior and latest else None,
             conflicts=occupied, conflict_token=conflicts.fingerprint(occupied, *slot),
@@ -161,6 +164,10 @@ def ensure_no_other_active(user, session):
 def check_publish_window(user, session, details):
     ensure_no_other_active(user, session)
     allowed, local_busy = conflicts.local_availability(user, session.starts_at, session.ends_at, exclude_sessions=[session.pk])
+    from goals.scheduling import apply_windows
+    task = Task.objects.select_related('goal__plan').get(pk=session.task_id)
+    profile = SchedulingPreferences.objects.get(user=user)
+    allowed = apply_windows(task.goal.plan, profile, session.starts_at, session.ends_at, allowed)
     if not any(left <= session.starts_at and right >= session.ends_at for left, right in allowed):
         raise SessionConflict('This time is protected or reserved by an in-flight operation; it cannot be overridden.')
     conflicts.check_review(session, conflicts.reviewed([*details, *local_busy], session.starts_at, session.ends_at))
@@ -333,7 +340,7 @@ def approve(user, session_id, *, allow_overlap=False, conflict_token=''):
         if session.lease_until and session.lease_until > timezone.now():
             raise SessionConflict('Approval is already in progress. Retry this same session shortly.')
         session.publish_attempt = attempt
-        session.lease_until = timezone.now() + timedelta(minutes=2)
+        session.lease_until = timezone.now() + timedelta(seconds=settings.CALENDAR_APPROVAL_LEASE_SECONDS)
         session.save(update_fields=['publish_attempt', 'lease_until'])
     try:
         return _approve(user, session_id, allow_overlap, conflict_token)
