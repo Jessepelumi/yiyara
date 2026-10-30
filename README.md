@@ -1,175 +1,73 @@
-# Yiyara Backend
+# Yiyara
 
-Yiyara turns an ambition into a persistent drawing board: the model first
-decomposes the ambition into goals, then breaks every goal into actionable
-tasks. An authenticated user can continue refining the whole board, or one
-selected goal, through a single plan conversation.
+Yiyara is a personal planning assistant that turns ambitions into concrete tasks
+and approved Google Calendar sessions. It asks for missing context, preserves
+waiting states, and adapts the plan to user-reported progress.
 
-The service is built with Django, Django REST Framework, PostgreSQL, JWT, and a
-provider-agnostic AI gateway. See [backend.md](backend.md) for the broader
-architecture and [docs/ai-workflow.md](docs/ai-workflow.md) for provider
-routing, retries, fallbacks, and the proposed background-job migration.
+This repository contains the Django REST backend. The current individual flow has
+been tested end to end through Postman with live AI and Google Calendar. Connecting
+the frontend to that flow is the next priority; it is not yet a verified web experience.
 
-## Current capabilities
+## What works
 
-- Anonymous decomposition preview without database persistence.
-- Authenticated decomposition persisted atomically as one plan, its goals,
-  tasks, initial conversation, and revision.
-- Goal and plan retrieval scoped to the authenticated user.
-- One drawing-board conversation per plan, with optional goal scope.
-- AI-proposed board changes that require explicit apply or reject actions.
-- Plan version checks and restorable board revisions.
-- Idempotent console messages through client-generated message IDs.
-- Bounded AI calls with structured output, retries, provider fallback, and
-  domain validation before writes.
-- Gemini plus an OpenAI-compatible adapter for Groq, OpenRouter, local Ollama,
-  and similar APIs.
+- Google sign-in and separate Calendar consent, with encrypted provider credentials.
+- Persistent ambitions, contextual clarification, questions and user-approved task proposals.
+- Actionable tasks with effort, completion criteria, prerequisites and blockers.
+- Calendar preferences, timezones and protected grey periods; reviewed session publication.
+- Explicit overlap decisions, duplicate-safe publishing, rescheduling, cancellation
+  and refresh after external Google edits.
+- Partial/completed/blocked/skipped progress, continuation sessions, AI replanning
+  and plan revisions that preserve reported work.
 
-## Core API
+Creating an ambition saves it first. AI clarification and task generation are
+separate requests. Accepting a task plan does not publish Calendar events; each
+session needs its own approval.
 
-Authentication:
+## Start here
 
-- `POST /api/users/auth/bridge/` exchanges a verified frontend identity for
-  backend JWTs.
+[Local setup](docs/guides/setup.md) →
+[Postman walkthrough](docs/guides/postman.md) →
+[December MVP checklist](docs/product/individual-mvp.md).
 
-Decomposition and plans:
+| Guide | Owns |
+| --- | --- |
+| [Authentication](docs/guides/authentication.md) | Google identity, application JWTs, refresh and account linking |
+| [Planning](docs/guides/planning.md) | Ambitions, clarification, task proposals, context and revision rules |
+| [Calendar configuration](docs/guides/calendar.md) | OAuth, calendar selection, working hours and grey periods |
+| [Sessions](docs/guides/sessions.md) | Scheduling, publication, conflicts, management and reconciliation |
+| [Progress](docs/guides/progress.md) | Outcomes, finishing sessions, continuation and replanning |
+| [AI configuration](docs/guides/ai-configuration.md) | Provider routing, limits, failures and request recovery |
+| [Deployment](docs/guides/deployment.md) | Production entry point and outstanding operational setup |
 
-- `POST /api/decompose/preview/` returns a guest preview and writes nothing.
-- `POST /api/decompose/` creates an authenticated user's plan.
-- `POST /api/plans/import-preview/` persists a prior guest preview.
-- `GET /api/plans/` lists the user's drawing boards.
-- `GET /api/plans/{plan_id}/` returns one board with nested goals and tasks.
-- `GET /api/list/` provides the legacy flat goal list.
+## System
 
-Drawing-board conversation:
+Python 3.12, Django, Django REST Framework, PostgreSQL, JWT and a configurable AI
+gateway. Gemini is the configured provider; an OpenAI-compatible adapter is also
+available but requires explicit provider configuration. Google Calendar writes
+are performed by backend services, not by the model.
 
-- `GET /api/conversations/plans/{plan_id}/messages/` returns its messages.
-- `POST /api/conversations/plans/{plan_id}/messages/` discusses or proposes
-  changes to the board. `scope_goal_id` may focus the prompt on one goal.
-- `POST /api/conversations/plans/{plan_id}/changes/{change_id}/apply/` applies
-  a proposal.
-- `POST /api/conversations/plans/{plan_id}/changes/{change_id}/reject/` rejects
-  a proposal.
-- `GET /api/plans/{plan_id}/revisions/` lists restorable revisions.
-- `POST /api/plans/{plan_id}/revisions/{version}/restore/` restores a snapshot
-  as a new plan version.
+`Plan → Goal → Task` stores the work; conversations, proposed changes and revisions
+store planning history. `WorkSession` represents a task's Calendar block, with
+separate publication, management, synchronization and completion state.
 
-Except for the preview route, these endpoints require a bearer token. Object
-queries are scoped to `request.user`.
+| Source | Responsibility |
+| --- | --- |
+| `users/` | Identity and JWT lifecycle |
+| `goals/`, `conversations/` | Context, questions, proposals and revisions |
+| `tasks/` | Task readiness, dependencies and outcomes |
+| `calendars/` | Credentials, availability, sessions and Google event lifecycle |
+| `ai/` | Prompts, structured output, provider adapters and retry policy |
+| `config/` | Application settings, shared policy, routes and server configuration |
 
-## AI execution model
+## Current boundaries
 
-The existing endpoints intentionally remain synchronous for frontend
-compatibility. The AI gateway keeps them bounded with:
+Scheduling handles one continuous task session at a time. There is no automatic
+session splitting, bulk ambition scheduling, resource research, cross-ambition
+priority optimization, background Calendar sync or messaging delivery yet. Team
+assignment and project management are later product scope.
 
-- per-attempt and total timeouts;
-- transient-error retries with exponential full jitter;
-- ordered fallback configured separately for each AI task;
-- JSON Schema output where supported;
-- application and domain validation before any plan data is persisted;
-- sanitized operational logs containing provider, model, attempt, latency, and
-  token usage, but not prompts or credentials.
+The December 14, 2026 target is an individual private beta, including one supported
+messaging channel. See the [MVP checklist](docs/product/individual-mvp.md) for the
+remaining release requirements.
 
-Making a Django view asynchronous would not make model work durable. The next
-stage is a persistent job model plus a Redis-backed worker, while reusing the
-same gateway. That migration is detailed in
-[docs/ai-workflow.md](docs/ai-workflow.md).
-
-## Local setup
-
-Requirements:
-
-- Python 3.10+
-- PostgreSQL
-- credentials for at least one hosted provider, or a local Ollama model
-
-```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-python manage.py migrate
-python manage.py runserver
-```
-
-Configure provider order in `.env`. Only providers named in a route are loaded;
-providers with missing credentials are skipped.
-
-```dotenv
-AI_PROVIDER_ORDER=groq,gemini
-AI_DECOMPOSITION_PROVIDERS=groq,gemini
-AI_PLAN_ITERATION_PROVIDERS=gemini,groq
-
-GROQ_API_KEY=your_key
-GROQ_MODEL=openai/gpt-oss-20b
-
-GEMINI_API_KEY=your_key
-GEMINI_MODEL=gemini-2.5-flash-lite
-```
-
-For local Ollama, add `ollama` to the desired route and set
-`OLLAMA_BASE_URL`. When Django runs in Docker, the default example uses
-`host.docker.internal` to reach Ollama on the host.
-
-The full configuration surface is documented in [.env.example](.env.example).
-
-## Usage examples
-
-Preview without authentication:
-
-```bash
-curl -X POST http://localhost:8000/api/decompose/preview/ \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Build a freelance design business"}'
-```
-
-Persist a decomposition:
-
-```bash
-curl -X POST http://localhost:8000/api/decompose/ \
-  -H "Authorization: Bearer <jwt_token>" \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Build a freelance design business"}'
-```
-
-Continue on its drawing board:
-
-```bash
-curl -X POST http://localhost:8000/api/conversations/plans/<plan_id>/messages/ \
-  -H "Authorization: Bearer <jwt_token>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "content":"Make the first task more specific",
-    "scope_goal_id":"<goal_id>",
-    "plan_version":1,
-    "client_id":"<client_generated_uuid>"
-  }'
-```
-
-AI changes are returned as proposals and do not mutate the board until the
-apply endpoint is called.
-
-## Development checks
-
-```bash
-python manage.py check
-python manage.py makemigrations --check --dry-run
-python manage.py test
-```
-
-To exercise configured AI routing manually:
-
-```bash
-python manage.py smartify "Learn Python and build a web application"
-```
-
-## Deployment notes
-
-- Do not use free hosted model tiers for sensitive production data without
-  reviewing their data-use terms.
-- PostgreSQL is required for normal deployment.
-- Redis and a worker are planned for durable background AI jobs; they are not
-  required by the current synchronous endpoints.
-- The project is private and proprietary.
-
-Built by Jesse Adesina as part of the Yiyara platform.
+Licensed under [MIT](LICENSE).
