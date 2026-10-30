@@ -1,94 +1,56 @@
-# Local Development Setup
+# Local setup
 
-This guide provides advanced setup instructions beyond the basic Quick Start in the main README. Ensure you've completed the [Quick Start](../README.md#quick-start) before proceeding.
+Requires Docker/Compose and a PostgreSQL database. The image uses Python 3.12;
+Compose starts only the backend and does not provision a database or frontend.
 
-## Environment Configuration Details
+## Configure
 
-### Database Setup
+From the repository root, copy `.env.example` to `.env` if you do not already have
+one. Preserve existing secrets. The template is a starting point; supported optional
+settings and defaults live in [config/settings.py](../../config/settings.py).
 
-Follow the [Neon Postgres Connection Guide](neon.md) to set up your database connection.
+Set `SECRET_KEY`, `DEBUG=True`, `ALLOWED_HOSTS`, and the database connection:
+`PGHOST`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGPORT`. `PGSSLMODE` defaults to
+`require`, suitable for the current hosted PostgreSQL setup. Local databases without
+TLS need an explicit appropriate setting.
 
-### AI Configuration
+Generate an application secret if needed:
 
-1. Obtain a Google Gemini API key from [Google AI Studio](https://makersuite.google.com/app/apikey)
-2. Add the API key to your `.env` file:
-
-```env
-GEMINI_API_KEY=your-gemini-api-key-here
-```
-
-### Django Configuration
-
-Add the following to your `.env` file:
-
-```env
-DEBUG=True
-SECRET_KEY=your-secure-django-secret-key-here
-```
-
-Generate a secure secret key using Python:
-
-```bash
+```sh
 python3 -c "import secrets; print(secrets.token_urlsafe(50))"
 ```
 
-## Development Workflow
+Configure [Google sign-in](authentication.md#google-configuration),
+[Calendar credentials](calendar.md#google-configuration), and
+[AI](ai-configuration.md#provider-configuration) before testing the complete flow.
+Never commit `.env` or print its contents in logs.
 
-### Running Commands
+## Run
 
-- View logs: `make logs`
-- Restart services: `make restart`
-- Stop services: `make down`
-- Django shell: `make shell`
-
-### Code Changes
-
-- Backend changes are automatically reloaded
-- Frontend uses hot reloading with Next.js
-- Database schema changes require new migrations
-
-## Troubleshooting
-
-### Running Commands
-
-- View logs: `make logs`
-- Restart services: `make restart`
-- Stop services: `make down`
-- Django shell: `make shell`
-
-### Code Changes
-
-- Backend changes are automatically reloaded
-- Frontend uses hot reloading with Next.js
-- Database schema changes require new migrations
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Port conflicts**: Ensure ports 3000 and 8000 are available
-2. **Database connection**: Verify Neon credentials in `.env`
-3. **AI features**: Check Gemini API key validity
-4. **Dependencies**: Ensure Docker has sufficient resources
-
-### Logs
-
-Check service logs:
-
-```bash
-make logs
+```sh
+docker compose up -d --build backend
+docker compose exec backend python manage.py migrate
+docker compose logs -f backend
 ```
 
-Or specific service:
+The API is at `http://localhost:8000`. Code is bind-mounted and runserver reloads
+changes. After editing `.env`, recreate the service to reload container variables:
 
-```bash
-docker-compose logs backend
-docker-compose logs frontend
+```sh
+docker compose up -d --force-recreate backend
 ```
 
-## Next Steps
+Rebuild after dependency changes. Use `docker compose down` to stop the service.
 
-- Review the [API Documentation](api.md) for available endpoints
-- Set up [AI Configuration](ai-configuration.md) for advanced features
-- Check the [Deployment Guide](deployment.md) for production setup</content>
-  <parameter name="filePath">/Users/jeolad/Documents/yiyara/docs/guides/setup.md
+## Verify
+
+```sh
+docker compose exec backend python manage.py check
+docker compose exec backend python manage.py makemigrations --check --dry-run
+docker compose exec backend python manage.py test --settings=config.test_settings
+```
+
+The test settings use temporary SQLite and simulated providers. For PostgreSQL
+coverage, run `python manage.py test --noinput --keepdb` inside the service against
+a dedicated test database/account with test-database permissions. Do not point test
+settings at production data. Live acceptance uses the [Postman guide](postman.md).
