@@ -22,7 +22,7 @@ If remaining_minutes is reported, preserve estimated_minutes too. Scheduling use
 reported remaining work. Never change IDs or progress/context counters.
 
 Never edit completed tasks, tasks under completed goals, skipped tasks (ask the user to
-reopen them explicitly), or IDs in protected_task_ids (publishing/published sessions).
+reopen them explicitly), or IDs in protected_task_ids (unfinished publishing/published sessions).
 Never bypass this restriction by duplicating a protected task as a new one. Never clear
 or rewrite an existing external blocker; ask the user to confirm/resolve it explicitly.
 Do not say a blocker is resolved merely because time passed or another task completed.
