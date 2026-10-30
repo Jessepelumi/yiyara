@@ -46,7 +46,7 @@ def protected_task_ids(plan):
     ids = list(Task.objects.filter(goal__plan=plan).values_list('pk', flat=True))
     strings = {str(pk) for pk in ids}
     sessions = WorkSession.objects.filter(
-        user_id=plan.user_id, status__in=['publishing', 'published'],
+        user_id=plan.user_id, finished_at__isnull=True, status__in=['publishing', 'published'],
     ).filter(Q(task_id__in=ids) | Q(task_snapshot__task_id__in=list(strings)))
     protected = set()
     for task_id, original_id in sessions.values_list('task_id', 'task_snapshot__task_id'):
@@ -89,7 +89,7 @@ def normalize_replan(plan, operation):
         if not task or task.is_completed or task.goal.is_completed:
             raise serializers.ValidationError('Revise only unfinished tasks in unfinished goals belonging to this plan.')
         if pk in protected:
-            raise serializers.ValidationError('Tasks with publishing or published sessions cannot be revised in this stage.')
+            raise serializers.ValidationError('Tasks with unfinished committed sessions cannot be revised.')
         if task.progress_status == 'skipped':
             raise serializers.ValidationError('Explicitly reopen skipped work before requesting revisions.')
         changes = dict(item['changes'])
