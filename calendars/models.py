@@ -85,6 +85,10 @@ class WorkSession(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     management_version = models.PositiveIntegerField(default=0)
     cancelled_at = models.DateTimeField(null=True)
+    finished_at = models.DateTimeField(null=True)
+    finish_outcome_id = models.UUIDField(null=True)
+    continuation_of = models.ForeignKey("self", null=True, on_delete=models.SET_NULL, related_name="continuations")
+    source_outcome_id = models.UUIDField(null=True)
     conflicts = models.JSONField(default=list, blank=True)
     conflict_token = models.CharField(max_length=64, blank=True)
     overlap_approved = models.BooleanField(default=False)
@@ -94,7 +98,7 @@ class WorkSession(models.Model):
         ordering = ["-created_at"]
         constraints = [
             models.CheckConstraint(condition=models.Q(ends_at__gt=models.F("starts_at")), name="session_positive_duration"),
-            models.UniqueConstraint(fields=["task"], condition=models.Q(status__in=["publishing", "published"]),
+            models.UniqueConstraint(fields=["task"], condition=models.Q(status__in=["publishing", "published"], finished_at__isnull=True),
                                     name="one_committed_session_per_task"),
         ]
 
