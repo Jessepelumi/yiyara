@@ -3,7 +3,7 @@ from rest_framework import serializers
 from rest_framework.response import Response
 from tasks.outcomes import OutcomeRequestSerializer
 
-from .models import WorkSession, SessionChange
+from .models import WorkSession, SessionChange, SessionReconciliation
 from .serializers import AvailabilitySerializer
 from .views import CalendarView
 from . import sessions
@@ -62,8 +62,16 @@ class SessionChangeSerializer(ConflictReviewMixin, serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class ReconciliationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SessionReconciliation
+        fields = ['id', 'kind', 'before', 'after', 'issues', 'observed_at']
+        read_only_fields = fields
+
+
 class SessionSerializer(ConflictReviewMixin, serializers.ModelSerializer):
     changes = SessionChangeSerializer(many=True, read_only=True)
+    reconciliations = ReconciliationSerializer(many=True, read_only=True)
     requires_conflict_approval = serializers.SerializerMethodField()
     message = serializers.SerializerMethodField()
     class Meta:
@@ -72,6 +80,7 @@ class SessionSerializer(ConflictReviewMixin, serializers.ModelSerializer):
                   'destination_calendar', 'google_event_id', 'task_snapshot', 'last_error',
                   'approved_at', 'published_at', 'management_version', 'cancelled_at', 'changes',
                   'finished_at', 'finish_outcome_id', 'continuation_of', 'source_outcome_id',
+                  'synced_at', 'sync_status', 'sync_error', 'sync_issues', 'remote_etag', 'remote_snapshot', 'reconciliations',
                   'conflicts', 'conflict_token', 'overlap_approved', 'overlap_history', 'requires_conflict_approval', 'message']
         read_only_fields = fields
 
@@ -91,6 +100,15 @@ class SessionDetailView(CalendarView):
     def get(self, request, session_id):
         session = get_object_or_404(WorkSession, pk=session_id, user=request.user)
         return Response(SessionSerializer(session).data)
+
+
+class RefreshSessionView(CalendarView):
+    def post(self, request, session_id):
+        from .reconciliation import refresh
+
+        if request.data:
+            raise serializers.ValidationError('Refresh reads the linked Google event; send no body.')
+        return Response(SessionSerializer(refresh(request.user, session_id)).data)
 
 
 class TaskSessionsView(CalendarView):
