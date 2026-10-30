@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 from pathlib import Path
 from datetime import timedelta
+from django.core.exceptions import ImproperlyConfigured
 
 
 load_dotenv()
@@ -20,13 +21,43 @@ def env_list(name, default):
     )
 
 
+def positive_int(name, default):
+    value = int(os.getenv(name, str(default)))
+    if value < 1:
+        raise ImproperlyConfigured(f'{name} must be positive.')
+    return value
+
+
+# Product limits apply per proposal, never to an entire ambition.
+PLAN_MAX_GOALS_PER_PROPOSAL = positive_int('PLAN_MAX_GOALS_PER_PROPOSAL', 3)
+PLAN_MAX_TASKS_PER_PROPOSAL = positive_int('PLAN_MAX_TASKS_PER_PROPOSAL', 10)
+PLAN_MAX_CHANGE_OPERATIONS = positive_int('PLAN_MAX_CHANGE_OPERATIONS', 25)
+PLAN_MAX_CLARIFICATION_CHANGES = positive_int('PLAN_MAX_CLARIFICATION_CHANGES', 10)
+if PLAN_MAX_CLARIFICATION_CHANGES > PLAN_MAX_CHANGE_OPERATIONS:
+    raise ImproperlyConfigured('Clarification changes must not exceed the operation limit.')
+PLAN_NEAR_TERM_DAYS = positive_int('PLAN_NEAR_TERM_DAYS', 7)
+MIN_SESSION_MINUTES = positive_int('MIN_SESSION_MINUTES', 5)
+MAX_SESSION_MINUTES = positive_int('MAX_SESSION_MINUTES', 480)
+SCHEDULE_MAX_RANGE_DAYS = positive_int('SCHEDULE_MAX_RANGE_DAYS', 31)
+PROPOSAL_TTL_SECONDS = positive_int('PROPOSAL_TTL_SECONDS', 86400)
+CALENDAR_APPROVAL_LEASE_SECONDS = positive_int('CALENDAR_APPROVAL_LEASE_SECONDS', 120)
+CONVERSATION_HISTORY_LIMIT = positive_int('CONVERSATION_HISTORY_LIMIT', 10)
+OUTCOME_HISTORY_LIMIT = positive_int('OUTCOME_HISTORY_LIMIT', 50)
+PLAN_MAX_QUESTIONS_PER_TURN = positive_int('PLAN_MAX_QUESTIONS_PER_TURN', 2)
+PLAN_MAX_OPEN_QUESTIONS = positive_int('PLAN_MAX_OPEN_QUESTIONS', 10)
+PLAN_MAX_QUESTIONS = positive_int('PLAN_MAX_QUESTIONS', 100)
+GOOGLE_REQUEST_TIMEOUT_SECONDS = positive_int('GOOGLE_REQUEST_TIMEOUT_SECONDS', 20)
+if MIN_SESSION_MINUTES > MAX_SESSION_MINUTES:
+    raise ImproperlyConfigured('MIN_SESSION_MINUTES must not exceed MAX_SESSION_MINUTES.')
+
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 # Security
 SECRET_KEY = os.getenv('SECRET_KEY')
 
-DEBUG = os.getenv("DEBUG", "True").lower() == "true"
+DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 
 ALLOWED_HOSTS = env_list(
     "ALLOWED_HOSTS",
@@ -86,17 +117,16 @@ MIDDLEWARE = [
 ]
 
 # CORS & CSRF
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
-
+CORS_ALLOWED_ORIGINS = env_list('CORS_ALLOWED_ORIGINS', ('http://localhost:3000', 'http://127.0.0.1:3000'))
 CORS_ALLOW_CREDENTIALS = True
-
-CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
+CSRF_TRUSTED_ORIGINS = env_list('CSRF_TRUSTED_ORIGINS', CORS_ALLOWED_ORIGINS)
+FRONTEND_URL = os.getenv('FRONTEND_URL', '')
+SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'false' if DEBUG else 'true').lower() == 'true'
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+SECURE_HSTS_SECONDS = int(os.getenv('SECURE_HSTS_SECONDS', '0'))
+if os.getenv('TRUST_PROXY_HTTPS', 'false').lower() == 'true':
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 
 # URLs and templates
@@ -130,7 +160,7 @@ DATABASES = {
         "PASSWORD": os.getenv("PGPASSWORD"),
         "PORT": os.getenv("PGPORT", 5432),
         "OPTIONS": {
-            "sslmode": "require",
+            "sslmode": os.getenv("PGSSLMODE", "require"),
         },
         "DISABLE_SERVER_SIDE_CURSORS": True,
         "CONN_HEALTH_CHECKS": True,
@@ -177,12 +207,12 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticated",
     ],
     "DEFAULT_THROTTLE_RATES": {
-        "goal_preview": "10/hour",
         "auth_google": "10/min",
         "auth_refresh": "20/min",
         "auth_logout": "20/min",
         "calendar": "30/min",
-        "task_planning": "10/min",
+        "task_planning": os.getenv("TASK_PLANNING_RATE", "10/min"),
+        "plan_chat": os.getenv("PLAN_CHAT_RATE", "10/min"),
     },
 }
 
@@ -211,6 +241,9 @@ AI_TOTAL_TIMEOUT_SECONDS = float(os.getenv("AI_TOTAL_TIMEOUT_SECONDS", "45"))
 AI_RETRY_MAX_ATTEMPTS = int(os.getenv("AI_RETRY_MAX_ATTEMPTS", "2"))
 AI_RETRY_MIN_SECONDS = float(os.getenv("AI_RETRY_MIN_SECONDS", "0.5"))
 AI_RETRY_MAX_SECONDS = float(os.getenv("AI_RETRY_MAX_SECONDS", "4"))
+AI_REQUEST_LEASE_SECONDS = positive_int('AI_REQUEST_LEASE_SECONDS', max(120, int(AI_TOTAL_TIMEOUT_SECONDS) + 30))
+if AI_REQUEST_LEASE_SECONDS <= AI_TOTAL_TIMEOUT_SECONDS:
+    raise ImproperlyConfigured('AI_REQUEST_LEASE_SECONDS must exceed the total AI timeout.')
 AI_MAX_OUTPUT_TOKENS = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "4096"))
 
 AI_PROVIDER_ORDER = env_list(
@@ -220,10 +253,6 @@ AI_PROVIDER_ORDER = env_list(
 
 AI_ROUTES = {
     "task_planning": env_list("AI_TASK_PLANNING_PROVIDERS", AI_PROVIDER_ORDER),
-    "goal_decomposition": env_list(
-        "AI_DECOMPOSITION_PROVIDERS",
-        AI_PROVIDER_ORDER,
-    ),
     "plan_iteration": env_list(
         "AI_PLAN_ITERATION_PROVIDERS",
         AI_PROVIDER_ORDER,

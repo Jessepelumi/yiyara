@@ -6,6 +6,8 @@ Thumbs.db
 
 # Docker & Environment
 .env
+.env.*
+!.env.example
 .dockerignore
 Dockerfile
 docker-compose.yml
@@ -26,3 +28,5 @@ static_root/
 .idea/
 *.swp
 *.bak
+# Manual model probe is not part of the running application.
+memory_test.py

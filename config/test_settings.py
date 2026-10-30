@@ -14,3 +14,7 @@ DATABASES = {
 PASSWORD_HASHERS = [
     "django.contrib.auth.hashers.MD5PasswordHasher",
 ]
+
+# API tests must not depend on local deployment redirect settings.
+DEBUG = False
+SECURE_SSL_REDIRECT = False

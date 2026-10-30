@@ -21,5 +21,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the Yiyara source code
 COPY . .
 
-# Start the Django server
-CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+# Production image entry point; docker-compose.yml explicitly overrides this for development.
+CMD ["gunicorn", "config.wsgi:application", "--config", "python:config.gunicorn"]
