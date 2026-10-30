@@ -1055,9 +1055,10 @@ class SessionManagementTests(APITestCase):
     def test_deleted_event_cancellation_is_local_only_and_move_does_not_recreate_it(self):
         self.event = None
         self.assertEqual(self.move().status_code, 409)
-        response = self.cancel()
-        self.assertEqual(response.status_code, 201, response.data)
-        self.assertEqual(self.approve_change(response).status_code, 200)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, 'cancelled')
+        self.assertEqual(self.session.sync_status, 'deleted')
+        self.assertEqual(self.cancel().status_code, 409)
         self.assertFalse(self.writes)
 
     def test_identity_mismatch_guest_events_and_recurring_events_are_protected(self):
@@ -1193,6 +1194,7 @@ class SessionManagementTests(APITestCase):
         self.assertEqual(result.status_code, 409, result.data)
         self.assertEqual(result.data['change']['status'], 'conflicted')
         self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.cancel().status_code, 409)  # Adopt external move before another write.
         cancellation = self.cancel()
         self.assertEqual(cancellation.status_code, 201, cancellation.data)
         self.assertEqual(self.approve_change(cancellation).status_code, 200)
@@ -1741,3 +1743,298 @@ class FinishedSessionManagementTests(APITestCase):
         self.assertEqual(replay.status_code, 200, replay.data)
         self.assertEqual(replay.data['task']['remaining_minutes'], 20)
         self.assertEqual(len(self.writes), 1)
+
+
+class GoogleReconciliationTests(APITestCase):
+    setUp = SessionManagementTests.setUp
+    calendar_api = SessionManagementTests.calendar_api
+    provider = SessionManagementTests.provider
+    move = SessionManagementTests.move
+    cancel = SessionManagementTests.cancel
+    approve_change = SessionManagementTests.approve_change
+
+    def refresh(self):
+        return self.client.post(f'/api/sessions/{self.session.pk}/refresh/')
+
+    def external_move(self, hours=3):
+        self.event['etag'] = '"external-v2"'
+        self.event['start'] = {'dateTime': (self.start + timedelta(hours=hours)).isoformat()}
+        self.event['end'] = {'dateTime': (self.start + timedelta(hours=hours + 1)).isoformat()}
+
+    def test_unchanged_refresh_is_read_only_and_does_not_duplicate_history(self):
+        from .models import SessionReconciliation
+        first = self.refresh()
+        self.assertEqual(first.status_code, 200, first.data)
+        self.assertEqual(first.data['sync_status'], 'current')
+        self.assertEqual(first.data['remote_etag'], self.event['etag'])
+        self.assertTrue(first.data['synced_at'])
+        self.assertEqual(first.data['management_version'], 0)
+        self.assertEqual(self.refresh().status_code, 200)
+        self.assertFalse(SessionReconciliation.objects.exists())
+        self.assertFalse(self.writes)
+
+    def test_move_updates_local_time_preserves_progress_and_invalidates_proposal(self):
+        from .models import SessionChange
+        proposal = self.move()
+        self.assertEqual(proposal.status_code, 201)
+        original_snapshot = self.session.task_snapshot.copy()
+        self.external_move()
+        self.event['summary'] = 'Changed in Google'
+        result = self.refresh()
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertEqual(result.data['sync_status'], 'current')
+        self.session.refresh_from_db()
+        self.task.refresh_from_db()
+        self.assertEqual(self.session.starts_at, self.start + timedelta(hours=3))
+        self.assertEqual(self.session.task_snapshot, original_snapshot)
+        self.assertEqual(self.session.event_payload['summary'], 'Changed in Google')
+        self.assertEqual(self.task.progress_version, 0)
+        self.assertEqual(SessionChange.objects.get(pk=proposal.data['change']['id']).status, 'rejected')
+        self.assertEqual(result.data['reconciliations'][0]['kind'], 'changed')
+        self.assertEqual(self.refresh().status_code, 200)
+        self.assertEqual(self.session.reconciliations.count(), 1)
+        self.assertFalse(self.writes)
+
+    def test_missing_event_cancels_locally_without_task_completion_or_recreation(self):
+        self.event = None
+        result = self.refresh()
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertEqual(result.data['status'], 'cancelled')
+        self.assertEqual(result.data['sync_status'], 'deleted')
+        self.assertEqual(result.data['reconciliations'][0]['kind'], 'deleted')
+        self.task.refresh_from_db()
+        self.assertFalse(self.task.is_completed)
+        self.assertEqual(self.task.progress_version, 0)
+        self.assertEqual(self.refresh().status_code, 200)
+        self.assertEqual(self.session.reconciliations.count(), 1)
+        self.assertFalse(self.writes)
+
+    def test_sparse_cancelled_event_and_gone_response_are_recognised(self):
+        from . import reconciliation
+        for code, event in [(200, {'id': self.session.google_event_id, 'status': 'cancelled'}), (410, {})]:
+            with self.subTest(code=code):
+                self.session.refresh_from_db()
+                with patch('calendars.management.remote', return_value=(code, event)):
+                    result = self.refresh()
+                self.assertEqual(result.status_code, 200, result.data)
+                self.assertEqual(result.data['sync_status'], 'deleted')
+        self.assertFalse(self.writes)
+
+    def test_access_failure_does_not_look_like_deletion_or_refresh_freshness(self):
+        self.assertEqual(self.refresh().status_code, 200)
+        self.session.refresh_from_db()
+        checked = self.session.synced_at
+        with patch('calendars.services.request_json', return_value=(403, {'error': {'message': 'private error'}})):
+            result = self.refresh()
+        self.assertEqual(result.status_code, 502, result.data)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, 'published')
+        self.assertEqual(self.session.synced_at, checked)
+        self.assertEqual(self.session.sync_status, 'error')
+        self.assertNotIn('private error', self.session.sync_error)
+        self.assertEqual(self.refresh().status_code, 200)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.sync_status, 'current')
+        self.assertEqual(self.session.sync_error, '')
+
+    def test_wrong_account_and_lost_calendar_access_never_cancel_session(self):
+        with patch('calendars.services.list_calendars', return_value=[]):
+            self.assertEqual(self.refresh().status_code, 409)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, 'published')
+        CalendarConnection.objects.filter(user=self.user).update(google_sub='different')
+        self.assertEqual(self.refresh().status_code, 409)
+        self.assertFalse(self.writes)
+
+    def test_unsupported_events_are_flagged_without_adopting_or_writing(self):
+        import copy
+        original = copy.deepcopy(self.event)
+        mutations = [
+            {'extendedProperties': None}, {'attendees': [{'email': 'private@example.com'}]},
+            {'recurrence': ['RRULE:FREQ=DAILY']}, {'start': {'date': '2026-11-01'}, 'end': {'date': '2026-11-02'}},
+            {'etag': ''}, {'etag': None}, {'start': {'dateTime': 'bad timestamp'}}, {'endTimeUnspecified': True},
+        ]
+        for mutation in mutations:
+            self.event = {**copy.deepcopy(original), **mutation}
+            result = self.refresh()
+            self.assertEqual(result.status_code, 200, result.data)
+            self.assertEqual(result.data['sync_status'], 'review')
+            self.assertTrue(result.data['sync_issues'])
+            self.session.refresh_from_db()
+            self.assertEqual(self.session.starts_at, self.start)
+            self.assertNotIn('private@example.com', str(result.data['remote_snapshot']))
+        self.assertFalse(self.writes)
+
+    def test_external_grey_period_move_is_reflected_and_flagged_not_undone(self):
+        from .models import ProtectedPeriod
+        self.external_move()
+        ProtectedPeriod.objects.create(user=self.user, kind='one_off', starts_at=self.start + timedelta(hours=3),
+                                       ends_at=self.start + timedelta(hours=4))
+        result = self.refresh()
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertEqual(result.data['sync_status'], 'review')
+        self.assertTrue(any('outside_availability' in value for value in result.data['sync_issues']))
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.starts_at, self.start + timedelta(hours=3))
+        self.assertFalse(self.writes)
+
+    def test_external_long_duration_is_bounded_and_deadline_violation_flagged(self):
+        self.task.due_date = self.start.date()
+        self.task.save()
+        self.event['end'] = {'dateTime': (self.start + timedelta(days=1000)).isoformat()}
+        with patch('calendars.reconciliation.permitted_windows') as windows:
+            result = self.refresh()
+        self.assertEqual(result.status_code, 200, result.data)
+        windows.assert_not_called()
+        self.assertEqual(result.data['sync_status'], 'review')
+        self.assertTrue(any('unsupported_duration' in value for value in result.data['sync_issues']))
+        self.assertTrue(any('after_deadline' in value for value in result.data['sync_issues']))
+
+    def test_reappeared_event_restores_only_without_another_active_commitment(self):
+        import copy
+        import uuid
+        from .models import WorkSession
+        original = copy.deepcopy(self.event)
+        self.event = None
+        self.assertEqual(self.refresh().status_code, 200)
+        self.event = original
+        restored = self.refresh()
+        self.assertEqual(restored.status_code, 200, restored.data)
+        self.assertEqual(restored.data['status'], 'published')
+        self.assertEqual(restored.data['reconciliations'][0]['kind'], 'restored')
+        self.event = None
+        self.assertEqual(self.refresh().status_code, 200)
+        self.session.refresh_from_db()
+        WorkSession.objects.create(user=self.user, task=self.task, status='published', starts_at=self.start,
+            ends_at=self.start + timedelta(hours=1), expires_at=self.start, destination_calendar='target',
+            google_sub='subject', google_event_id=uuid.uuid4().hex, task_snapshot=self.session.task_snapshot)
+        self.event = original
+        result = self.refresh()
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.data['status'], 'cancelled')
+        self.assertEqual(result.data['sync_status'], 'review')
+        self.assertTrue(any('another_active_session' in value for value in result.data['sync_issues']))
+        self.assertFalse(self.writes)
+
+    def test_pending_write_and_live_lease_block_refresh_without_reading_google(self):
+        from .models import SessionChange
+        proposal = self.move()
+        SessionChange.objects.filter(pk=proposal.data['change']['id']).update(status='applying')
+        with patch('calendars.management.remote') as remote:
+            self.assertEqual(self.refresh().status_code, 409)
+        remote.assert_not_called()
+        SessionChange.objects.filter(pk=proposal.data['change']['id']).update(status='proposed', lease_until=timezone.now() + timedelta(minutes=1))
+        with patch('calendars.management.remote') as remote:
+            self.assertEqual(self.refresh().status_code, 409)
+        remote.assert_not_called()
+
+    def test_concurrent_local_change_does_not_adopt_stale_google_response(self):
+        from .models import WorkSession
+        def raced(*args, **kwargs):
+            WorkSession.objects.filter(pk=self.session.pk).update(management_version=10)
+            self.external_move()
+            return 200, self.event
+        with patch('calendars.management.remote', side_effect=raced):
+            self.assertEqual(self.refresh().status_code, 409)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.starts_at, self.start)
+        self.assertEqual(self.session.management_version, 10)
+        self.assertIsNone(self.session.synced_at)
+
+    def test_failed_local_history_save_rolls_back_adoption_and_invalidation(self):
+        from .models import SessionChange
+        proposal = self.move()
+        self.external_move()
+        with patch('calendars.models.SessionReconciliation.objects.create', side_effect=RuntimeError('Local save failure')):
+            with self.assertRaises(RuntimeError):
+                self.refresh()
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.starts_at, self.start)
+        self.assertEqual(SessionChange.objects.get(pk=proposal.data['change']['id']).status, 'proposed')
+
+    def test_management_detects_external_changes_before_submitting_writes(self):
+        proposal = self.move()
+        self.external_move()
+        result = self.approve_change(proposal)
+        self.assertEqual(result.status_code, 409, result.data)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.starts_at, self.start + timedelta(hours=3))
+        self.assertFalse(self.writes)
+        # The next proposal uses reconciled time and the current Google ETag.
+        replacement = self.move(time_min=(self.start + timedelta(hours=5)).isoformat())
+        self.assertEqual(replacement.status_code, 201, replacement.data)
+        self.assertEqual(self.approve_change(replacement).status_code, 200)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_finished_history_and_deleted_task_survive_external_refresh(self):
+        import uuid
+        finished_at, outcome_id = timezone.now(), uuid.uuid4()
+        self.session.finished_at, self.session.finish_outcome_id = finished_at, outcome_id
+        self.session.save()
+        self.task.delete()
+        self.external_move()
+        result = self.refresh()
+        self.assertEqual(result.status_code, 200, result.data)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.finished_at, finished_at)
+        self.assertEqual(self.session.finish_outcome_id, outcome_id)
+        self.assertIsNone(self.session.task_id)
+        self.assertFalse(self.writes)
+
+    def test_authentication_ownership_and_request_body(self):
+        other = get_user_model().objects.create_user(email='sync-foreign@example.com')
+        self.client.force_authenticate(other)
+        with patch('calendars.management.remote') as remote:
+            self.assertEqual(self.refresh().status_code, 404)
+        remote.assert_not_called()
+        self.client.force_authenticate(None)
+        self.assertEqual(self.refresh().status_code, 401)
+        self.client.force_authenticate(self.user)
+        self.assertEqual(self.client.post(f'/api/sessions/{self.session.pk}/refresh/', {'status': 'cancelled'}, format='json').status_code, 400)
+
+    def test_access_revoked_between_calendar_check_and_missing_event_is_not_deletion(self):
+        self.event = None
+        with patch('calendars.services.list_calendars', side_effect=[[{'id': 'target', 'accessRole': 'owner'}], []]):
+            result = self.refresh()
+        self.assertEqual(result.status_code, 409)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, 'published')
+        self.assertIsNone(self.session.synced_at)
+
+    def test_restored_transparent_event_does_not_create_a_ghost_busy_interval(self):
+        from .conflicts import local_availability
+        self.event['transparency'] = 'transparent'
+        self.event['etag'] = '"available"'
+        result = self.refresh()
+        self.assertEqual(result.status_code, 200, result.data)
+        allowed, busy = local_availability(self.user, self.start, self.start + timedelta(hours=2))
+        self.assertTrue(allowed)
+        self.assertEqual(busy, [])
+
+    def test_two_refreshes_cannot_apply_an_older_remote_observation_last(self):
+        from . import reconciliation, sessions
+        self.session.refresh_from_db()
+        old_token = reconciliation.token(self.session)
+        self.external_move()
+        self.assertEqual(self.refresh().status_code, 200)
+        with self.assertRaises(sessions.SessionConflict):
+            reconciliation.observe(self.user, self.session.pk, old_token, 200, self.event)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.starts_at, self.start + timedelta(hours=3))
+
+    def test_unsupported_observed_formats_cannot_be_written_by_management(self):
+        self.event['endTimeUnspecified'] = True
+        self.assertEqual(self.refresh().data['sync_status'], 'review')
+        self.assertEqual(self.move().status_code, 409)
+        self.assertEqual(self.cancel().status_code, 409)
+        self.event.pop('endTimeUnspecified')
+        original_start, original_end = self.event['start'], self.event['end']
+        self.event['start'], self.event['end'] = {'date': '2026-11-01'}, {'date': '2026-11-02'}
+        self.assertEqual(self.refresh().data['sync_status'], 'review')
+        self.assertEqual(self.cancel().status_code, 409)
+        self.event['start'], self.event['end'] = original_start, original_end
+        self.event['end'] = {'dateTime': (self.start + timedelta(hours=9)).isoformat()}
+        self.event['etag'] = '"long-session"'
+        self.assertEqual(self.refresh().data['sync_status'], 'review')
+        self.assertEqual(self.move().status_code, 409)
+        self.assertFalse(self.writes)
