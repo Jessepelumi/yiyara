@@ -169,6 +169,8 @@ def propose(user, session_id, kind, data):
         existing = replay(user, session_id, canonical, data['client_id'])
         if existing:
             return existing, True
+        if kind == 'reschedule' and session.finished_at:
+            raise Conflict('Finished sessions cannot be rescheduled. Propose a continuation for remaining work.')
         if session.status != 'published':
             raise Conflict('Only a published session can be moved or cancelled. Reconcile initial publishing first.')
         if session.changes.filter(status='applying').exists():
