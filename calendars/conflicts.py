@@ -19,6 +19,8 @@ def local_availability(user, start, end, *, exclude_sessions=(), exclude_change=
     hard, occupancy = [], []
     for session in WorkSession.objects.filter(user=user, starts_at__lt=end, ends_at__gt=start).exclude(pk__in=exclude_sessions):
         if session.status == 'published' and session.pk not in pending:
+            if session.event_payload.get('transparency') == 'transparent':
+                continue
             occupancy.append({'calendar_id': session.destination_calendar, 'start': session.starts_at, 'end': session.ends_at})
         elif session.status == 'publishing' or session.pk in pending or (session.status == 'proposed' and session.expires_at > timezone.now()):
             hard.append((session.starts_at, session.ends_at))
