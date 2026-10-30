@@ -111,7 +111,7 @@ def propose(user, task_id, start, end, *, preferred_start=None, conflict_policy=
         if (connection.source_calendars, connection.destination_calendar, connection.google_sub) != (sources, target, subject):
             raise SessionConflict('Calendar preferences changed. Request a new proposal.')
         if WorkSession.objects.filter(user=user, task_snapshot__task_id=str(task.pk),
-                                      status__in=['publishing', 'published']).exists():
+                                      finished_at__isnull=True, status__in=['publishing', 'published']).exists():
             raise SessionConflict('This task already has a committed session.')
         preferences = SchedulingPreferences.objects.filter(user=user).first()
         if not preferences:
@@ -130,6 +130,10 @@ def propose(user, task_id, start, end, *, preferred_start=None, conflict_policy=
         slot = conflicts.select_slot(windows, [*busy, *local_busy], duration, preferred=preferred_start, policy=conflict_policy)
         occupied = conflicts.reviewed([*busy, *local_busy], *slot)
         WorkSession.objects.filter(pk__in=previous).update(status='rejected')
+        prior = WorkSession.objects.filter(user=user, task_snapshot__task_id=str(task.pk),
+                                           finished_at__isnull=False).order_by("-finished_at").first()
+        from tasks.models import TaskOutcome
+        latest = TaskOutcome.objects.filter(plan=task.goal.plan, task_id=task.pk).first()
         session_id = uuid.uuid4()
         event_id = session_id.hex
         payload = {
@@ -143,11 +147,19 @@ def propose(user, task_id, start, end, *, preferred_start=None, conflict_policy=
             id=session_id, user=user, task=task, starts_at=slot[0], ends_at=slot[1],
             expires_at=min(slot[0], timezone.now() + timedelta(hours=24)), destination_calendar=target,
             google_sub=subject, google_event_id=event_id, task_snapshot=original, event_payload=payload,
+            continuation_of=prior, source_outcome_id=latest.pk if prior and latest else None,
             conflicts=occupied, conflict_token=conflicts.fingerprint(occupied, *slot),
         )
 
 
+def ensure_no_other_active(user, session):
+    if WorkSession.objects.filter(user=user, task_snapshot__task_id=session.task_snapshot["task_id"],
+                                  finished_at__isnull=True, status__in=["publishing", "published"]).exclude(pk=session.pk).exists():
+        raise SessionConflict("This task already has an unfinished committed session.")
+
+
 def check_publish_window(user, session, details):
+    ensure_no_other_active(user, session)
     allowed, local_busy = conflicts.local_availability(user, session.starts_at, session.ends_at, exclude_sessions=[session.pk])
     if not any(left <= session.starts_at and right >= session.ends_at for left, right in allowed):
         raise SessionConflict('This time is protected or reserved by an in-flight operation; it cannot be overridden.')
