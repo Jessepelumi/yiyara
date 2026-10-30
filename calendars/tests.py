@@ -1502,3 +1502,242 @@ class OverlapSchedulingTests(APITestCase):
                       (self.start + timedelta(seconds=10)).isoformat(), (self.end - timedelta(minutes=1)).isoformat()]:
             with self.subTest(value=value):
                 self.assertEqual(self.propose(preferred_start=value).status_code, 400)
+
+
+class ContinuationSessionTests(APITestCase):
+    setUp = TaskSessionTests.setUp
+    freebusy = TaskSessionTests.freebusy
+    propose = TaskSessionTests.propose
+    session = TaskSessionTests.session
+    approve = TaskSessionTests.approve
+
+    def published(self):
+        session = self.session()
+        with patch('calendars.sessions.event_request', return_value=(201, session.event_payload)):
+            self.assertEqual(self.approve(session).status_code, 200)
+        session.refresh_from_db()
+        return session
+
+    def body(self, **changes):
+        import uuid
+        self.plan.refresh_from_db()
+        return {'client_id': str(uuid.uuid4()), 'plan_version': self.plan.version,
+                'status': 'partial', 'remaining_minutes': 20, 'spent_minutes': 40, **changes}
+
+    def finish(self, session, body=None):
+        return self.client.post(f'/api/sessions/{session.pk}/finish/', body or self.body(), format='json')
+
+    def test_partial_finish_continuation_approval_and_history(self):
+        from .models import WorkSession
+        first = self.published()
+        payload, event_id = first.event_payload.copy(), first.google_event_id
+        from goals.replanning import protected_task_ids
+        self.assertIn(str(self.task.pk), protected_task_ids(self.plan))
+        with patch('calendars.services.request_json') as remote:
+            result = self.finish(first)
+        self.assertEqual(result.status_code, 201, result.data)
+        remote.assert_not_called()
+        first.refresh_from_db()
+        self.assertIsNotNone(first.finished_at)
+        self.assertNotIn(str(self.task.pk), protected_task_ids(self.plan))
+        self.assertEqual(first.status, 'published')
+        self.assertEqual(first.event_payload, payload)
+        self.assertEqual(first.google_event_id, event_id)
+        self.assertFalse(result.data['task']['is_completed'])
+        response = self.propose()
+        self.assertEqual(response.status_code, 201, response.data)
+        second = WorkSession.objects.get(pk=response.data['id'])
+        self.assertEqual(second.continuation_of, first)
+        self.assertEqual(str(second.source_outcome_id), result.data['outcome']['id'])
+        self.assertEqual(second.ends_at - second.starts_at, timedelta(minutes=20))
+        self.assertNotEqual(second.google_event_id, first.google_event_id)
+        self.assertGreaterEqual(second.starts_at, first.ends_at)
+        with patch('calendars.sessions.event_request', return_value=(201, second.event_payload)) as remote:
+            self.assertEqual(self.approve(second).status_code, 200)
+            self.assertEqual(self.approve(second).status_code, 200)
+            self.assertEqual(remote.call_count, 1)
+        self.assertEqual(self.propose().status_code, 409)
+        history = self.client.get(f'/api/tasks/{self.task.pk}/sessions/')
+        self.assertEqual(len(history.data), 2)
+        self.assertEqual(self.finish(second, self.body(status='completed', remaining_minutes=0)).status_code, 201)
+        self.assertEqual(self.propose().status_code, 400)
+
+    def test_exact_retry_does_not_rewind_newer_progress_or_finish_twice(self):
+        from tasks.models import TaskOutcome
+        session = self.published()
+        body = self.body()
+        self.assertEqual(self.finish(session, body).status_code, 201)
+        self.assertEqual(self.finish(session, body).status_code, 200)
+        self.assertEqual(TaskOutcome.objects.count(), 1)
+        changed = {**body, 'remaining_minutes': 15}
+        self.assertEqual(self.finish(session, changed).status_code, 409)
+        self.assertEqual(self.finish(session).status_code, 409)
+        newer = self.body(remaining_minutes=10)
+        self.assertEqual(self.client.post(f'/api/tasks/{self.task.pk}/outcomes/', newer, format='json').status_code, 201)
+        replay = self.finish(session, body)
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(replay.data['task']['remaining_minutes'], 10)
+        self.assertEqual(TaskOutcome.objects.count(), 2)
+
+    def test_progress_report_alone_does_not_finish_session(self):
+        session = self.published()
+        response = self.client.post(f'/api/tasks/{self.task.pk}/outcomes/', self.body(session_id=str(session.pk)), format='json')
+        self.assertEqual(response.status_code, 201)
+        session.refresh_from_db()
+        self.assertIsNone(session.finished_at)
+        self.assertEqual(self.propose().status_code, 409)
+
+    def test_invalid_unconfirmed_and_foreign_sessions_do_not_record_progress(self):
+        from tasks.models import TaskOutcome
+        session = self.session()
+        self.assertEqual(self.finish(session).status_code, 409)
+        session.status = 'publishing'
+        session.save()
+        self.assertEqual(self.finish(session).status_code, 409)
+        session.status = 'published'
+        session.save()
+        self.assertEqual(self.finish(session, self.body(plan_version=999)).status_code, 409)
+        self.assertEqual(self.finish(session, self.body(remaining_minutes=0)).status_code, 400)
+        self.assertEqual(self.finish(session, self.body(session_id=str(session.pk))).status_code, 400)
+        self.assertEqual(self.finish(session, self.body(status='reopened')).status_code, 400)
+        other = get_user_model().objects.create_user(email='foreign@example.com')
+        self.client.force_authenticate(other)
+        self.assertEqual(self.finish(session).status_code, 404)
+        self.assertEqual(self.client.get(f'/api/tasks/{self.task.pk}/sessions/').status_code, 404)
+        self.assertFalse(TaskOutcome.objects.exists())
+
+    def test_finished_session_cannot_move_but_task_can_be_edited(self):
+        import uuid
+        session = self.published()
+        self.assertEqual(self.finish(session).status_code, 201)
+        with patch('calendars.management.remote') as remote:
+            result = self.client.post(f'/api/sessions/{session.pk}/reschedule/', {
+                'client_id': str(uuid.uuid4()), 'time_min': self.start.isoformat(), 'time_max': self.end.isoformat(),
+            }, format='json')
+        self.assertEqual(result.status_code, 409)
+        remote.assert_not_called()
+        edited = self.client.patch(f'/api/tasks/{self.task.pk}/', {'title': 'Finish remaining exercise'}, format='json')
+        self.assertEqual(edited.status_code, 200, edited.data)
+        session.refresh_from_db()
+        self.assertNotEqual(session.task_snapshot['title'], edited.data['title'])
+
+    def test_blocked_or_skipped_finish_needs_readiness_before_continuing(self):
+        session = self.published()
+        result = self.finish(session, self.body(status='blocked', blocker_reason='Waiting for feedback'))
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(self.propose().status_code, 400)
+        response = self.client.post(f'/api/tasks/{self.task.pk}/outcomes/', self.body(status='reopened'), format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(self.propose().status_code, 201)
+
+    def test_finish_rejects_pending_changes_and_blocks_uncertain_changes(self):
+        import uuid
+        from .models import SessionChange
+        from tasks.models import TaskOutcome
+        session = self.published()
+        change = SessionChange.objects.create(session=session, user=self.user, client_id=uuid.uuid4(),
+            kind='cancel', status='applying', base_version=0, expires_at=self.start)
+        self.assertEqual(self.finish(session).status_code, 409)
+        self.assertFalse(TaskOutcome.objects.exists())
+        session.refresh_from_db()
+        self.assertIsNone(session.finished_at)
+        change.status = 'proposed'
+        change.save()
+        self.assertEqual(self.finish(session).status_code, 201)
+        change.refresh_from_db()
+        self.assertEqual(change.status, 'rejected')
+
+    def test_continuation_stale_progress_and_restored_active_identity_are_guarded(self):
+        from .models import WorkSession
+        first = self.published()
+        self.assertEqual(self.finish(first).status_code, 201)
+        response = self.propose()
+        second = WorkSession.objects.get(pk=response.data['id'])
+        changed = self.client.post(f'/api/tasks/{self.task.pk}/outcomes/', self.body(remaining_minutes=10), format='json')
+        self.assertEqual(changed.status_code, 201)
+        with patch('calendars.sessions.event_request') as remote:
+            self.assertEqual(self.approve(second).status_code, 409)
+        remote.assert_not_called()
+        response = self.propose()
+        second = WorkSession.objects.get(pk=response.data['id'])
+        with patch('calendars.sessions.event_request', return_value=(201, second.event_payload)):
+            self.assertEqual(self.approve(second).status_code, 200)
+        # Revision restore can sever the FK; stable snapshot identity must still block duplicates.
+        second.refresh_from_db()
+        second.task = None
+        second.save()
+        self.assertEqual(self.propose().status_code, 409)
+        history = self.client.get(f'/api/tasks/{self.task.pk}/sessions/')
+        self.assertEqual(len(history.data), 3)
+
+    def test_database_allows_history_but_only_one_unfinished_commitment(self):
+        import uuid
+        from django.db import IntegrityError, transaction
+        from .models import WorkSession
+        first = self.published()
+        fields = {field: getattr(first, field) for field in (
+            'user', 'task', 'status', 'starts_at', 'ends_at', 'expires_at', 'destination_calendar',
+            'google_sub', 'task_snapshot', 'event_payload')}
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            WorkSession.objects.create(**fields, google_event_id=uuid.uuid4().hex)
+        self.assertEqual(self.finish(first).status_code, 201)
+        WorkSession.objects.create(**fields, google_event_id=uuid.uuid4().hex)
+        self.assertEqual(WorkSession.objects.filter(status='published').count(), 2)
+
+    def test_finished_history_survives_task_deletion_and_is_user_scoped(self):
+        from .models import WorkSession
+        session = self.published()
+        self.assertEqual(self.finish(session).status_code, 201)
+        task_id = self.task.pk
+        self.task.delete()
+        history = self.client.get(f'/api/tasks/{task_id}/sessions/')
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual(history.data[0]['id'], str(session.pk))
+        self.assertIsNone(history.data[0]['task_id'])
+        self.assertTrue(WorkSession.objects.get(pk=session.pk).finished_at)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get(f'/api/tasks/{task_id}/sessions/').status_code, 401)
+
+
+    def test_finish_rolls_back_report_if_session_save_fails(self):
+        from tasks.models import TaskOutcome
+        session = self.published()
+        self.plan.refresh_from_db()
+        original_version = self.plan.version
+        with patch('calendars.models.WorkSession.save', side_effect=RuntimeError('Simulated local save failure')):
+            with self.assertRaises(RuntimeError):
+                self.finish(session)
+        session.refresh_from_db()
+        self.task.refresh_from_db()
+        self.plan.refresh_from_db()
+        self.assertIsNone(session.finished_at)
+        self.assertEqual(self.task.progress_version, 0)
+        self.assertEqual(self.plan.version, original_version)
+        self.assertFalse(TaskOutcome.objects.exists())
+
+
+class FinishedSessionManagementTests(APITestCase):
+    setUp = SessionManagementTests.setUp
+    calendar_api = SessionManagementTests.calendar_api
+    provider = SessionManagementTests.provider
+    cancel = SessionManagementTests.cancel
+    approve_change = SessionManagementTests.approve_change
+
+    def test_explicit_cancellation_preserves_finished_outcome_and_retry(self):
+        import uuid
+        body = {'client_id': str(uuid.uuid4()), 'plan_version': self.plan.version,
+                'status': 'partial', 'remaining_minutes': 20}
+        url = f'/api/sessions/{self.session.pk}/finish/'
+        result = self.client.post(url, body, format='json')
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(self.writes, [])
+        cancellation = self.cancel()
+        self.assertEqual(cancellation.status_code, 201, cancellation.data)
+        self.assertEqual(self.approve_change(cancellation).status_code, 200)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, 'cancelled')
+        self.assertIsNotNone(self.session.finished_at)
+        replay = self.client.post(url, body, format='json')
+        self.assertEqual(replay.status_code, 200, replay.data)
+        self.assertEqual(replay.data['task']['remaining_minutes'], 20)
+        self.assertEqual(len(self.writes), 1)
