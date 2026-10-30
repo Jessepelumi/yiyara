@@ -236,7 +236,10 @@ def confirm_event(session, event):
         valid = False
     if not valid:
         raise SessionConflict('Existing Google event differs from the approved session. No new event was created.')
-    WorkSession.objects.filter(pk=session.pk).update(status='published', published_at=timezone.now(), last_error='')
+    from .reconciliation import summary
+    WorkSession.objects.filter(pk=session.pk).update(
+        status='published', published_at=timezone.now(), last_error='', synced_at=timezone.now(),
+        sync_status='current', sync_error='', sync_issues=[], remote_etag=event.get('etag', ''), remote_snapshot=summary(event))
     session.refresh_from_db()
     return session
 
