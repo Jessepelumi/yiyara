@@ -1,0 +1,983 @@
+{
+  "info": {
+    "name": "Yiyara \u2014 ambition to Google Calendar (manual review)",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Send requests manually in their listed order. Do not use Collection Runner: questions and approvals require human review. Approve reviewed session writes a real Google event. Setup and usage: docs/guides/postman.md. Credentials must remain local."
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{access_token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string"
+    },
+    {
+      "key": "google_id_token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "access_token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "refresh_token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "calendar_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "calendar_authorization_url",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "plan_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "plan_version",
+      "value": 1,
+      "type": "string"
+    },
+    {
+      "key": "change_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "task_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "session_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "question_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "question_answer",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "chat_client_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "task_client_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "finish_client_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "time_min",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "time_max",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "conflict_token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "google_event_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "protected_period_id",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Google sign-in",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/users/auth/google/",
+        "description": "Paste a fresh Google ID token in collection variables. This is not a Google OAuth access token.",
+        "auth": {
+          "type": "noauth"
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"id_token\": \"{{google_id_token}}\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"access_token\", data.access);",
+              "pm.collectionVariables.set(\"refresh_token\", data.refresh);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Confirm signed-in user",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{base_url}}/api/users/me/",
+        "description": ""
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.test(\"User returned\", () => pm.expect(data.id).to.exist);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Start Calendar connection (if needed)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/calendar/google/connect/",
+        "description": "Open authorization_url in your browser, complete consent using the same account, then return to Postman. Skip if already connected. Do not run the callback manually.",
+        "body": {
+          "mode": "raw",
+          "raw": "{}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"calendar_authorization_url\", data.authorization_url);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Check Calendar connection",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{base_url}}/api/calendar/connection/",
+        "description": ""
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.test(\"Calendar is connected\", () => pm.expect(data.connected).to.eql(true));",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "List calendars",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{base_url}}/api/calendar/calendars/",
+        "description": "Choose an owned calendar ID and put it in calendar_id. Use a dedicated test calendar if possible; do not choose a public holiday calendar."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.test(\"Calendars returned\", () => pm.expect(data.calendars).to.be.an(\"array\"));",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Select source and destination calendar",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/calendar/preferences/",
+        "description": "This smoke test uses the same owned calendar for availability and destination. Include other real busy calendars in source_calendars if needed.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"source_calendars\": [\n    \"{{calendar_id}}\"\n  ],\n  \"destination_calendar\": \"{{calendar_id}}\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Save timezone and working hours",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/calendar/scheduling-preferences/",
+        "description": "Updates your global scheduling preferences. Adjust timezone and hours before sending; weekday 0 is Monday.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"timezone\": \"Europe/London\",\n  \"working_hours\": [\n    {\n      \"weekday\": 0,\n      \"start_time\": \"09:00\",\n      \"end_time\": \"17:00\"\n    },\n    {\n      \"weekday\": 1,\n      \"start_time\": \"09:00\",\n      \"end_time\": \"17:00\"\n    },\n    {\n      \"weekday\": 2,\n      \"start_time\": \"09:00\",\n      \"end_time\": \"17:00\"\n    },\n    {\n      \"weekday\": 3,\n      \"start_time\": \"09:00\",\n      \"end_time\": \"17:00\"\n    },\n    {\n      \"weekday\": 4,\n      \"start_time\": \"09:00\",\n      \"end_time\": \"17:00\"\n    }\n  ],\n  \"preferred_session_minutes\": 60\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Add lunch grey period (once)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/calendar/protected-periods/",
+        "description": "Creates a real protected period. Send once, or skip if you already have one. Delete it after testing if unwanted.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"title\": \"Postman test lunch\",\n  \"kind\": \"weekly\",\n  \"weekdays\": [\n    0,\n    1,\n    2,\n    3,\n    4\n  ],\n  \"start_time\": \"12:00\",\n  \"end_time\": \"13:00\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([201]).to.include(pm.response.code));",
+              "if ([201].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"protected_period_id\", data.id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Save ambition",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/plans/",
+        "description": "Creates a real saved ambition. Initial goals and questions are empty; AI is called separately. Sending again creates another ambition.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"text\": \"Learn Python arrays and list traversal. I know Python variables and loops. I can study on weekdays from 15:00 to 17:00. Start with one concrete 30-minute exercise.\",\n  \"title\": \"Postman: practise Python arrays\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([201]).to.include(pm.response.code));",
+              "if ([201].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"plan_id\", data.id);",
+              "pm.collectionVariables.set(\"plan_version\", data.version);",
+              "for (const key of [\"change_id\", \"task_id\", \"session_id\", \"chat_client_id\", \"task_client_id\", \"finish_client_id\"]) pm.collectionVariables.set(key, \"\");",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Ask AI to clarify",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/conversations/plans/{{plan_id}}/messages/",
+        "description": "Review messages and change.operations before applying. No change means there is nothing to apply. For a different message clear chat_client_id; retain it for exact retries.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"content\": \"I know Python variables and loops. I can study on weekdays from 15:00 to 17:00. Start with one concrete 30-minute exercise. Please confirm this context, interpret the calendar restriction, and ask only for information you still need.\",\n  \"plan_version\": {{plan_version}},\n  \"client_id\": \"{{chat_client_id}}\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (!pm.collectionVariables.get(\"chat_client_id\") || pm.collectionVariables.get(\"chat_client_id\") === \"{$guid}\") pm.collectionVariables.set(\"chat_client_id\", pm.variables.replaceIn(\"{{$guid}}\"));"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200,201]).to.include(pm.response.code));",
+              "if ([200,201].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"change_id\", data.change ? data.change.id : \"\");",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Apply reviewed context/questions",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/conversations/plans/{{plan_id}}/changes/{{change_id}}/apply/",
+        "description": "Send only after reviewing the change from Ask AI to clarify. Skip if change is null. Applying changes advances plan_version.",
+        "body": {
+          "mode": "raw",
+          "raw": "{}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"plan_version\", data.plan.version);",
+              "pm.collectionVariables.set(\"change_id\", \"\");",
+              "const tasks = data.plan.goals.flatMap(g => g.tasks);",
+              "const task = tasks.find(t => t.is_schedulable);",
+              "pm.collectionVariables.set(\"task_id\", task ? task.id : \"\");",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Inspect full plan and questions",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{base_url}}/api/plans/{{plan_id}}/",
+        "description": "All goals and nested tasks are returned here. Answer any open required questions before task generation. Save question_id if needed."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"plan_version\", data.version);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Optional \u2014 Answer a required question",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/plans/{{plan_id}}/questions/{{question_id}}/answer/",
+        "description": "Repeat for each actual required question. Answers must match the question. Then return to clarification if needed. Do not run without a question.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"plan_version\": {{plan_version}},\n  \"answer\": \"{{question_answer}}\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"plan_version\", data.version);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Confirm explicit context and calendar rules",
+      "request": {
+        "method": "PATCH",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/plans/{{plan_id}}/context/",
+        "description": "Explicit manual confirmation for this controlled test; replaces the listed context fields and ambition-specific rules. Review the values. Skip only if approved AI context already matches. Do this BEFORE generating tasks; later context changes invalidate task readiness. Does not answer open questions.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"plan_version\": {{plan_version}},\n  \"starting_point\": \"I know Python variables and loops.\",\n  \"timing\": \"Study on weekdays from 15:00 to 17:00.\",\n  \"constraints\": [],\n  \"scheduling_rules\": {\n    \"not_before\": null,\n    \"deadline\": null,\n    \"working_hours\": [\n    {\n        \"weekday\": 0,\n        \"start_time\": \"15:00\",\n        \"end_time\": \"17:00\"\n    },\n    {\n        \"weekday\": 1,\n        \"start_time\": \"15:00\",\n        \"end_time\": \"17:00\"\n    },\n    {\n        \"weekday\": 2,\n        \"start_time\": \"15:00\",\n        \"end_time\": \"17:00\"\n    },\n    {\n        \"weekday\": 3,\n        \"start_time\": \"15:00\",\n        \"end_time\": \"17:00\"\n    },\n    {\n        \"weekday\": 4,\n        \"start_time\": \"15:00\",\n        \"end_time\": \"17:00\"\n    }\n]\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"plan_version\", data.version);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Ask AI for concrete tasks",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/plans/{{plan_id}}/tasks/propose/",
+        "description": "Review reply and change.operations. Tasks do not exist until approved. AI output may differ; do not apply unsuitable work. Null change means more clarification is needed.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"plan_version\": {{plan_version}},\n  \"client_id\": \"{{task_client_id}}\",\n  \"focus\": \"Propose one ready 30-minute Python list indexing exercise. Specify exact instructions and a verifiable completion criterion. Avoid prerequisites or external resources for this first exercise.\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (!pm.collectionVariables.get(\"task_client_id\") || pm.collectionVariables.get(\"task_client_id\") === \"{$guid}\") pm.collectionVariables.set(\"task_client_id\", pm.variables.replaceIn(\"{{$guid}}\"));"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200,201]).to.include(pm.response.code));",
+              "if ([200,201].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"change_id\", data.change ? data.change.id : \"\");",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Apply reviewed task proposal",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/conversations/plans/{{plan_id}}/changes/{{change_id}}/apply/",
+        "description": "Creates reviewed tasks and selects the first schedulable task in task_id for inspection. Verify its duration and instructions yourself.",
+        "body": {
+          "mode": "raw",
+          "raw": "{}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"plan_version\", data.plan.version);",
+              "pm.collectionVariables.set(\"change_id\", \"\");",
+              "const tasks = data.plan.goals.flatMap(g => g.tasks);",
+              "const task = tasks.find(t => t.is_schedulable);",
+              "pm.collectionVariables.set(\"task_id\", task ? task.id : \"\");",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Inspect chosen task",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{base_url}}/api/tasks/{{task_id}}/",
+        "description": "Check scheduling_blockers, effective_minutes, completion_criteria and dependencies. A different task can be selected by changing task_id."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.test(\"Task is schedulable\", () => pm.expect(data.is_schedulable).to.eql(true));",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Propose a free time block",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/tasks/{{task_id}}/sessions/propose/",
+        "description": "Finds a continuous block using task effort; no Google event is written. Review starts_at, ends_at, destination and conflicts. Dates are generated once; clear them for a later test. avoid never requests ordinary-event overlap.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"time_min\": \"{{time_min}}\",\n  \"time_max\": \"{{time_max}}\",\n  \"conflict_policy\": \"avoid\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (!pm.collectionVariables.get(\"time_min\") || !pm.collectionVariables.get(\"time_max\")) {",
+              "  const start = new Date(); start.setUTCDate(start.getUTCDate() + 2); start.setUTCHours(0,0,0,0);",
+              "  const end = new Date(start); end.setUTCDate(end.getUTCDate() + 7);",
+              "  pm.collectionVariables.set(\"time_min\", start.toISOString()); pm.collectionVariables.set(\"time_max\", end.toISOString());",
+              "}"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([201]).to.include(pm.response.code));",
+              "if ([201].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"session_id\", data.id);",
+              "pm.collectionVariables.set(\"conflict_token\", data.conflict_token || \"\");",
+              "pm.test(\"Still a proposal\", () => pm.expect(data.status).to.eql(\"proposed\"));",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Approve reviewed session (REAL CALENDAR WRITE)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/sessions/{{session_id}}/approve/",
+        "description": "Only send when you accept the proposed time. This creates a REAL Google Calendar event. Sending this exact request again must return the same event ID without a duplicate. On uncertain failure retry this same session; do not generate another one.",
+        "body": {
+          "mode": "raw",
+          "raw": "{}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.test(\"Published\", () => pm.expect(data.status).to.eql(\"published\"));",
+              "pm.collectionVariables.set(\"google_event_id\", data.google_event_id);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Refresh linked Calendar event",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": "{{base_url}}/api/sessions/{{session_id}}/refresh/",
+        "description": "Read-only Google reconciliation. No body. Check sync_status and sync_issues. It never marks the task completed."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Fetch latest plan version before reporting work",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{base_url}}/api/plans/{{plan_id}}/",
+        "description": ""
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"plan_version\", data.version);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Finish test session (optional simulated completion)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/sessions/{{session_id}}/finish/",
+        "description": "Use only on test work or when actually completed. Marks task completed and releases commitment; keeps the historical Google event. For partial work instead use status partial and remaining_minutes.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"client_id\": \"{{finish_client_id}}\",\n  \"plan_version\": {{plan_version}},\n  \"status\": \"completed\",\n  \"notes\": \"Postman lifecycle test; this is a simulated completion.\",\n  \"spent_minutes\": 30\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (!pm.collectionVariables.get(\"finish_client_id\") || pm.collectionVariables.get(\"finish_client_id\") === \"{$guid}\") pm.collectionVariables.set(\"finish_client_id\", pm.variables.replaceIn(\"{{$guid}}\"));"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200,201]).to.include(pm.response.code));",
+              "if ([200,201].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"plan_version\", data.plan_version);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Optional \u2014 Refresh application JWT",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": "{{base_url}}/api/users/auth/refresh/",
+        "description": "Access defaults to 30 minutes; configurable with JWT_ACCESS_TOKEN_MINUTES. Save the rotated refresh token; the prior refresh token is blacklisted.",
+        "auth": {
+          "type": "noauth"
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"refresh\": \"{{refresh_token}}\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Expected response status\", () => pm.expect([200]).to.include(pm.response.code));",
+              "if ([200].includes(pm.response.code)) {",
+              "const data = pm.response.json();",
+              "pm.collectionVariables.set(\"access_token\", data.access);",
+              "if (data.refresh) pm.collectionVariables.set(\"refresh_token\", data.refresh);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Optional \u2014 Delete test grey period",
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "url": "{{base_url}}/api/calendar/protected-periods/{{protected_period_id}}/",
+        "description": "Deletes only the grey period created by Add lunch grey period. Does not remove Google events."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Deleted\", () => pm.expect(pm.response.code).to.eql(204));"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
