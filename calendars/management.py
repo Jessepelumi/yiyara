@@ -55,11 +55,15 @@ def missing(code, event):
 
 
 def managed_event(session, code, event):
-    if code != 200 or event.get('id') != session.google_event_id or event.get(
-        'extendedProperties', {}).get('private', {}).get('yiyara_session_id') != str(session.pk):
+    extended = event.get('extendedProperties')
+    private = extended.get('private') if isinstance(extended, dict) else None
+    if (code != 200 or event.get('id') != session.google_event_id or not isinstance(private, dict)
+            or private.get('yiyara_session_id') != str(session.pk)):
         raise Conflict('This is not the original Yiyara event. No calendar change was made.')
-    if event.get('recurrence') or event.get('recurringEventId') or event.get('attendees'):
-        raise Conflict('Recurring events and events with guests are not supported by session management yet.')
+    if (event.get('recurrence') or event.get('recurringEventId') or event.get('attendees')
+            or event.get('endTimeUnspecified') or event.get('eventType', 'default') != 'default'):
+        raise Conflict('Only timed, non-recurring, default events without guests are supported by session management.')
+    event_times(event)
     if not isinstance(event.get('etag'), str) or not event['etag']:
         raise services.CalendarError('Google returned no event version; no change was made.')
 
@@ -79,6 +83,8 @@ def event_summary(event):
 
 
 def editable_task(session, saved=None):
+    if not timedelta(minutes=5) <= session.ends_at - session.starts_at <= timedelta(minutes=480):
+        raise Conflict('External session duration is unsupported. Correct it in Google or cancel the session.')
     task = Task.objects.select_related('goal__plan').filter(pk=session.task_id, goal__user_id=session.user_id).first()
     if not task:
         raise Conflict('The original task no longer exists. The event can still be cancelled.')
@@ -176,8 +182,11 @@ def propose(user, session_id, kind, data):
         if session.changes.filter(status='applying').exists():
             raise Conflict('An earlier calendar change is unconfirmed. Retry approval of that same change.')
         version = session.management_version
-    check_account(user, session)
-    code, event = remote(user, session)
+    from . import reconciliation
+    code, event = reconciliation.read_verified(user, session)
+    session = reconciliation.observe(user, session.pk, reconciliation.token(session), code, event)
+    if session.management_version != version:
+        raise Conflict('Google changes were reconciled. Review the refreshed session and request a new proposal.')
     gone = missing(code, event)
     if not gone:
         managed_event(session, code, event)
@@ -202,7 +211,7 @@ def propose(user, session_id, kind, data):
             if session.starts_at <= timezone.now() or data['time_min'] <= timezone.now():
                 raise ValidationError('Rescheduling requires future sessions and a future search range.')
             if event_times(event) != (session.starts_at, session.ends_at):
-                raise Conflict('The event was moved outside Yiyara. Automatic reconciliation is not available yet; cancellation remains available.')
+                raise Conflict('The event changed during proposal. Refresh the session and request a new proposal.')
             profile = SchedulingPreferences.objects.filter(user=user).first()
             if not profile:
                 raise ValidationError('Set scheduling preferences first.')
@@ -248,10 +257,16 @@ def finalize(session, change, event=None):
         conflicts.record_consent(session, change.pk)
         session.event_payload = {**session.event_payload, 'start': copy.deepcopy(event['start']),
             'end': copy.deepcopy(event['end']), 'extendedProperties': copy.deepcopy(event['extendedProperties'])}
+    from .reconciliation import summary
+    session.synced_at, session.sync_error, session.sync_issues = timezone.now(), '', []
+    session.sync_status = 'deleted' if change.kind == 'cancel' else 'current'
+    session.remote_snapshot = summary(event) if event else {'id': session.google_event_id, 'status': 'cancelled'}
+    session.remote_etag = session.remote_snapshot.get('etag', '')
     session.management_version += 1
     session.last_error = ''
     session.save(update_fields=['status', 'cancelled_at', 'starts_at', 'ends_at', 'event_payload', 'management_version', 'last_error',
-                                'conflicts', 'conflict_token', 'overlap_approved', 'overlap_history'])
+                                'conflicts', 'conflict_token', 'overlap_approved', 'overlap_history',
+                                'synced_at', 'sync_status', 'sync_error', 'sync_issues', 'remote_snapshot', 'remote_etag'])
     change.status = 'applied'
     change.applied_at = timezone.now()
     change.last_error = ''
@@ -279,9 +294,13 @@ def conflicted(change):
 def _approve(user, change_id, attempt, allow_overlap=False, conflict_token=''):
     change = SessionChange.objects.select_related('session').get(pk=change_id, user=user)
     session = change.session
-    check_account(user, session)
-    code, event = remote(user, session)
+    from . import reconciliation
+    code, event = reconciliation.read_verified(user, session)
     first = change.status == 'proposed'
+    if first:
+        observed = reconciliation.observe(user, session.pk, reconciliation.token(session), code, event, allow_change=change.pk)
+        if observed.management_version != change.base_version:
+            raise Conflict('Google changes were reconciled. Review the refreshed session and request a new proposal.')
     with transaction.atomic():
         services.lock_user(user)
         change = SessionChange.objects.select_for_update().get(pk=change_id, user=user)
