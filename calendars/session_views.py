@@ -1,6 +1,7 @@
 from django.shortcuts import get_object_or_404
 from rest_framework import serializers
 from rest_framework.response import Response
+from tasks.outcomes import OutcomeRequestSerializer
 
 from .models import WorkSession, SessionChange
 from .serializers import AvailabilitySerializer
@@ -70,6 +71,7 @@ class SessionSerializer(ConflictReviewMixin, serializers.ModelSerializer):
         fields = ['id', 'task_id', 'status', 'starts_at', 'ends_at', 'expires_at',
                   'destination_calendar', 'google_event_id', 'task_snapshot', 'last_error',
                   'approved_at', 'published_at', 'management_version', 'cancelled_at', 'changes',
+                  'finished_at', 'finish_outcome_id', 'continuation_of', 'source_outcome_id',
                   'conflicts', 'conflict_token', 'overlap_approved', 'overlap_history', 'requires_conflict_approval', 'message']
         read_only_fields = fields
 
@@ -89,6 +91,39 @@ class SessionDetailView(CalendarView):
     def get(self, request, session_id):
         session = get_object_or_404(WorkSession, pk=session_id, user=request.user)
         return Response(SessionSerializer(session).data)
+
+
+class TaskSessionsView(CalendarView):
+    def get(self, request, task_id):
+        from tasks.models import Task
+        from django.http import Http404
+
+        history = WorkSession.objects.filter(user=request.user, task_snapshot__task_id=str(task_id))
+        if not history.exists() and not Task.objects.filter(pk=task_id, goal__user=request.user).exists():
+            raise Http404
+        return Response(SessionSerializer(history, many=True).data)
+
+
+class FinishSessionSerializer(OutcomeRequestSerializer):
+    status = serializers.ChoiceField(choices=['completed', 'partial', 'blocked', 'skipped'])
+
+    def validate(self, attrs):
+        if attrs.get('session_id') is not None:
+            raise serializers.ValidationError('The session is selected by the URL; omit session_id.')
+        return super().validate(attrs)
+
+
+class FinishSessionView(CalendarView):
+    def post(self, request, session_id):
+        from .execution import finish
+        from tasks.serializers import TaskWriteSerializer, TaskOutcomeSerializer
+
+        serializer = FinishSessionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        session, task, plan, outcome, replayed = finish(request.user, session_id, serializer.validated_data)
+        return Response({'session': SessionSerializer(session).data, 'task': TaskWriteSerializer(task).data,
+                         'outcome': TaskOutcomeSerializer(outcome).data, 'plan_version': plan.version,
+                         'replayed': replayed}, status=200 if replayed else 201)
 
 
 class SessionApproveView(CalendarView):
