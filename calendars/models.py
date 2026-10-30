@@ -89,6 +89,15 @@ class WorkSession(models.Model):
     finish_outcome_id = models.UUIDField(null=True)
     continuation_of = models.ForeignKey("self", null=True, on_delete=models.SET_NULL, related_name="continuations")
     source_outcome_id = models.UUIDField(null=True)
+    synced_at = models.DateTimeField(null=True)
+    sync_status = models.CharField(max_length=12, default='unknown', choices=[
+        ('unknown', 'Not checked'), ('current', 'Current'), ('deleted', 'Deleted'),
+        ('review', 'Needs review'), ('error', 'Unavailable'),
+    ])
+    sync_error = models.CharField(max_length=200, blank=True)
+    sync_issues = models.JSONField(default=list, blank=True)
+    remote_etag = models.CharField(max_length=1024, blank=True)
+    remote_snapshot = models.JSONField(default=dict, blank=True)
     conflicts = models.JSONField(default=list, blank=True)
     conflict_token = models.CharField(max_length=64, blank=True)
     overlap_approved = models.BooleanField(default=False)
@@ -101,6 +110,22 @@ class WorkSession(models.Model):
             models.UniqueConstraint(fields=["task"], condition=models.Q(status__in=["publishing", "published"], finished_at__isnull=True),
                                     name="one_committed_session_per_task"),
         ]
+
+
+class SessionReconciliation(models.Model):
+    """Observed external changes, independent of user-approved calendar writes."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    session = models.ForeignKey(WorkSession, on_delete=models.CASCADE, related_name='reconciliations')
+    kind = models.CharField(max_length=12, choices=[
+        ('changed', 'Changed'), ('deleted', 'Deleted'), ('restored', 'Restored'), ('unsupported', 'Unsupported'),
+    ])
+    before = models.JSONField()
+    after = models.JSONField()
+    issues = models.JSONField(default=list)
+    observed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-observed_at', '-id']
 
 
 class SessionChange(models.Model):
