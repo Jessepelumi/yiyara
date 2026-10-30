@@ -2,7 +2,7 @@ from unittest.mock import Mock, patch
 
 import httpx
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from conversations.models import Conversation, Message
@@ -19,7 +19,6 @@ from ai.providers.base import (
 )
 from ai.providers.gemini_provider import GeminiProvider
 from ai.providers.openai_compatible_provider import OpenAICompatibleProvider
-from workflow.ai_engine import GoalDecompositionError, YiyaraWorkflow
 
 User = get_user_model()
 
@@ -57,220 +56,35 @@ class SequencedProvider:
         )
 
 
-VALID_DECOMPOSITION = [
-    {
-        "title": "Launch portfolio",
-        "description": "Publish a portfolio with three case studies.",
-        "due_date": "2026-09-30",
-        "tasks": [
-            {
-                "title": "Draft case studies",
-                "description": "Write three concise case studies.",
-                "due_date": "2026-09-15",
-            },
-            {
-                "title": "Deploy site",
-                "description": "Publish the final site.",
-                "due_date": "2026-09-30",
-            },
-        ],
-    }
-]
-
-
-class GoalWorkflowTests(TestCase):
+class RetiredPlanningTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user(email="owner@example.com")
-
-    def test_valid_ai_output_is_saved_atomically(self):
-        workflow = YiyaraWorkflow(gateway=StubGateway(VALID_DECOMPOSITION))
-
-        plan = workflow.create_plan_from_ai(self.user, "Build my portfolio")
-
-        self.assertEqual(plan.goals.count(), 1)
-        goal = plan.goals.get()
-        self.assertEqual(plan.raw_input, "Build my portfolio")
-        self.assertEqual(goal.raw_input, "Build my portfolio")
-        self.assertEqual(goal.tasks.count(), 2)
-        self.assertEqual(
-            Task.objects.get(title="Draft case studies").due_date.isoformat(),
-            "2026-09-15",
-        )
-        self.assertEqual(
-            Message.objects.get(conversation__plan=plan).role,
-            Message.Role.ASSISTANT,
-        )
-        self.assertTrue(PlanRevision.objects.filter(plan=plan, version=1).exists())
-
-    def test_invalid_ai_output_saves_nothing(self):
-        invalid = [{**VALID_DECOMPOSITION[0], "tasks": []}]
-        workflow = YiyaraWorkflow(gateway=StubGateway(invalid))
-
-        with self.assertRaises(GoalDecompositionError):
-            workflow.create_plan_from_ai(self.user, "Build my portfolio")
-
-        self.assertFalse(Plan.objects.exists())
-        self.assertFalse(Goal.objects.exists())
-        self.assertFalse(Task.objects.exists())
-
-    def test_database_error_rolls_back_goal_and_tasks(self):
-        workflow = YiyaraWorkflow(gateway=StubGateway(VALID_DECOMPOSITION))
-
-        with patch(
-            "workflow.ai_engine.Task.objects.bulk_create",
-            side_effect=RuntimeError("database write failed"),
-        ):
-            with self.assertRaises(RuntimeError):
-                workflow.create_plan_from_ai(self.user, "Build my portfolio")
-
-        self.assertFalse(Plan.objects.exists())
-        self.assertFalse(Goal.objects.exists())
-        self.assertFalse(Task.objects.exists())
-
-
-class GoalApiTests(TestCase):
-    def setUp(self):
-        self.user = User.objects.create_user(email="owner@example.com")
-        self.other_user = User.objects.create_user(email="other@example.com")
         self.client = APIClient()
-        self.client.force_authenticate(self.user)
 
-    def test_user_can_decompose_then_fetch_nested_tasks(self):
-        with patch(
-            "workflow.ai_engine.get_ai_gateway",
-            return_value=StubGateway(VALID_DECOMPOSITION),
-        ):
-            create_response = self.client.post(
-                "/api/decompose/",
-                {"text": "Build my portfolio"},
-                format="json",
-            )
-
-        self.assertEqual(create_response.status_code, 201)
-        self.assertEqual(len(create_response.data["goals"]), 1)
-        self.assertEqual(len(create_response.data["goals"][0]["tasks"]), 2)
-        self.assertIsNotNone(create_response.data["conversation_id"])
-
-        private_plan = Plan.objects.create(
-            user=self.other_user,
-            title="Private plan",
-            raw_input="Private plan",
-        )
-        Goal.objects.create(
-            plan=private_plan,
-            user=self.other_user,
-            title="Private goal",
-        )
-        list_response = self.client.get("/api/list/")
-
-        self.assertEqual(list_response.status_code, 200)
-        self.assertEqual(len(list_response.data), 1)
-        self.assertEqual(list_response.data[0]["title"], "Launch portfolio")
-        self.assertEqual(len(list_response.data[0]["tasks"]), 2)
-
-    def test_guest_can_preview_decomposition_without_persisting(self):
-        self.client.force_authenticate(user=None)
-
-        with patch(
-            "workflow.ai_engine.get_ai_gateway",
-            return_value=StubGateway(VALID_DECOMPOSITION),
-        ):
-            response = self.client.post(
-                "/api/decompose/preview/",
-                {"text": "Build my portfolio"},
-                format="json",
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["title"], "Build my portfolio")
-        self.assertEqual(response.data["goals"][0]["title"], "Launch portfolio")
-        self.assertEqual(len(response.data["goals"][0]["tasks"]), 2)
-        self.assertNotIn("id", response.data["goals"][0])
+    def test_removed_routes_are_not_registered_and_create_nothing(self):
+        from django.urls import Resolver404, resolve
+        for user in [None, self.user]:
+            self.client.force_authenticate(user)
+            for url in ['/api/decompose/', '/api/decompose/preview/', '/api/plans/import-preview/']:
+                with self.assertRaises(Resolver404):
+                    resolve(url)
+                self.assertEqual(self.client.post(url, {}, format='json').status_code, 404)
         self.assertFalse(Plan.objects.exists())
         self.assertFalse(Goal.objects.exists())
         self.assertFalse(Task.objects.exists())
         self.assertFalse(Conversation.objects.exists())
         self.assertFalse(Message.objects.exists())
 
-    def test_authenticated_user_can_import_guest_preview_as_one_board(self):
-        response = self.client.post(
-            "/api/plans/import-preview/",
-            {
-                "title": "Build my portfolio",
-                "raw_input": "Build my portfolio",
-                "goals": VALID_DECOMPOSITION,
-            },
-            format="json",
-        )
-
-        self.assertEqual(response.status_code, 201)
-        self.assertEqual(len(response.data["goals"]), 1)
-        plan = Plan.objects.get(user=self.user)
-        self.assertEqual(plan.goals.count(), 1)
-        self.assertTrue(Conversation.objects.filter(plan=plan).exists())
-        self.assertTrue(PlanRevision.objects.filter(plan=plan, version=1).exists())
-
-    def test_invalid_ai_output_returns_error_and_does_not_persist(self):
-        with patch(
-            "workflow.ai_engine.get_ai_gateway",
-            return_value=StubGateway({"title": "not a list"}),
-        ):
-            response = self.client.post(
-                "/api/decompose/",
-                {"text": "Build my portfolio"},
-                format="json",
-            )
-
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(response.data["error"], "goal_decomposition_failed")
-        self.assertFalse(Goal.objects.exists())
-
-    def test_missing_ai_configuration_returns_service_unavailable(self):
-        with patch(
-            "workflow.ai_engine.get_ai_gateway",
-            side_effect=AIConfigurationError("No AI provider is configured"),
-        ):
-            response = self.client.post(
-                "/api/decompose/",
-                {"text": "Build my portfolio"},
-                format="json",
-            )
-
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.data["error"], "ai_not_configured")
-        self.assertFalse(Goal.objects.exists())
-
-    def test_goal_endpoints_require_authentication(self):
-        self.client.force_authenticate(user=None)
-
-        create_response = self.client.post(
-            "/api/decompose/",
-            {"text": "Build my portfolio"},
-            format="json",
-        )
-        list_response = self.client.get("/api/list/")
-        plans_response = self.client.get("/api/plans/")
-        import_response = self.client.post(
-            "/api/plans/import-preview/",
-            {
-                "title": "Build my portfolio",
-                "raw_input": "Build my portfolio",
-                "goals": VALID_DECOMPOSITION,
-            },
-            format="json",
-        )
-
-        self.assertEqual(create_response.status_code, 401)
-        self.assertEqual(list_response.status_code, 401)
-        self.assertEqual(plans_response.status_code, 401)
-        self.assertEqual(import_response.status_code, 401)
+    def test_old_command_is_not_registered(self):
+        from django.core.management import get_commands
+        self.assertNotIn('smartify', get_commands())
 
 
 class AIGatewayTests(TestCase):
     def make_gateway(self, providers, route=("primary", "backup"), **policy):
         return AIGateway(
             providers=providers,
-            routes={AITask.GOAL_DECOMPOSITION.value: route},
+            routes={AITask.TASK_PLANNING.value: route},
             retry_policy=RetryPolicy(
                 max_attempts=policy.get("max_attempts", 2),
                 min_delay_seconds=0,
@@ -283,7 +97,7 @@ class AIGatewayTests(TestCase):
 
     def generate(self, gateway):
         return gateway.generate_json(
-            task=AITask.GOAL_DECOMPOSITION,
+            task=AITask.TASK_PLANNING,
             prompt="test",
             system_prompt="test",
             response_schema={"type": "object"},
@@ -334,7 +148,7 @@ class AIGatewayTests(TestCase):
             return payload
 
         result = gateway.generate_json(
-            task=AITask.GOAL_DECOMPOSITION,
+            task=AITask.TASK_PLANNING,
             prompt="test",
             system_prompt="test",
             response_schema={"type": "object"},
@@ -433,7 +247,10 @@ class ContextualPlanningTests(TestCase):
         response = self.client.post('/api/plans/', {'text': 'Learn to drive'}, format='json')
         self.assertEqual(response.status_code, 201, response.data)
         self.plan = Plan.objects.get(pk=response.data['id'])
-        self.question = self.plan.questions.get()
+        from goals.models import PlanQuestion
+        from goals.services import create_plan_revision
+        self.question = PlanQuestion.objects.create(plan=self.plan, text='What is your starting point?', field='starting_point')
+        create_plan_revision(self.plan, 'Test fixture: reviewed starting-point question')
         self.chat_url = f'/api/conversations/plans/{self.plan.pk}/messages/'
 
     def chat(self, content, operations, client_id=None, version=None):
@@ -458,13 +275,13 @@ class ContextualPlanningTests(TestCase):
         return self.client.post(f"/api/conversations/plans/{self.plan.pk}/changes/{response.data['change']['id']}/apply/")
 
     def test_intake_is_saved_without_ai_and_without_goals(self):
-        with patch('workflow.ai_engine.get_ai_gateway', side_effect=AssertionError('Must not call AI')):
+        with patch('ai.gateway.get_ai_gateway', side_effect=AssertionError('Must not call AI')):
             response = self.client.post('/api/plans/', {'text': 'Learn DSA'}, format='json')
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.data['planning_state'], 'clarifying')
         self.assertEqual(response.data['planning_mode'], 'contextual')
         self.assertEqual(response.data['goals'], [])
-        self.assertEqual(len(response.data['questions']), 1)
+        self.assertEqual(len(response.data['questions']), 0)
         self.assertEqual(self.plan.goals.count(), 0)
         self.assertTrue(self.plan.revisions.filter(version=1).exists())
         self.assertEqual(self.client.get(f'/api/plans/{self.plan.pk}/').data['context']['desired_outcome'], 'Learn to drive')
@@ -654,7 +471,8 @@ class ActionableTaskPlanningTests(TestCase):
         self.client.force_authenticate(self.user)
         response = self.client.post('/api/plans/', {'text': 'Learn DSA'}, format='json')
         self.plan = Plan.objects.get(pk=response.data['id'])
-        question = self.plan.questions.get()
+        from goals.models import PlanQuestion
+        question = PlanQuestion.objects.create(plan=self.plan, text='What is your starting point?', field='starting_point')
         response = self.client.post(f'/api/plans/{self.plan.pk}/questions/{question.pk}/answer/', {
             'plan_version': self.plan.version, 'answer': 'I know Python but have never studied arrays.'}, format='json')
         self.assertEqual(response.status_code, 200, response.data)
@@ -708,7 +526,7 @@ class ActionableTaskPlanningTests(TestCase):
         self.plan.refresh_from_db()
         original_context_version = self.plan.context_version
         response = self.client.patch(f'/api/plans/{self.plan.pk}/context/', {
-            'plan_version': self.plan.version, 'constraints': ['Only twenty minutes available per day.']}, format='json')
+            'plan_version': self.plan.version, 'constraints': ['Keep practice tasks short.'], 'scheduling_rules': {}}, format='json')
         self.assertEqual(response.status_code, 200, response.data)
         task = Task.objects.get(title='Trace array indexing in Python')
         self.assertFalse(self.client.get(f'/api/tasks/{task.pk}/').data['is_schedulable'])
@@ -1217,3 +1035,184 @@ class TaskReplanningTests(TestCase):
                 self.assertEqual(response.status_code, 502, response.data)
         self.assertEqual(self.propose({**self.payload, 'unexpected': True})[0].status_code, 502)
         self.assertFalse(self.plan.changes.exists())
+
+
+class AuditPlanningRegressionTests(TestCase):
+    def setUp(self):
+        import uuid
+        from django.core.cache import cache
+        from goals.planning import create_ambition
+        cache.clear()
+        self.user = User.objects.create_user(email='audit-fixes@example.com')
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.plan = create_ambition(self.user, 'Learn arrays; I already know Python')
+        self.plan.context['starting_point'] = 'I already know Python'
+        self.plan.save()
+        self.request = {'client_id': str(uuid.uuid4()), 'plan_version': self.plan.version}
+
+    def payload(self, groups, tasks):
+        return {'reply': 'Review proposed tasks', 'summary': 'Next actions', 'goals': [
+            {'title': f'Goal {i}', 'tasks': [
+                {'key': f'work_{i}_{j}', 'title': f'Action {i}-{j}', 'description': 'Write and test one solution.',
+                 'completion_criteria': f'Checked output {i}-{j}', 'estimated_minutes': 15, 'readiness': 'ready',
+                 'blocker_reason': '', 'depends_on': []} for j in range(tasks)]} for i in range(groups)]}
+
+    def propose(self, payload):
+        with patch('goals.task_planning.get_ai_gateway', return_value=StubGateway(payload)):
+            return self.client.post(f'/api/plans/{self.plan.pk}/tasks/propose/', self.request, format='json')
+
+    @override_settings(PLAN_MAX_GOALS_PER_PROPOSAL=4, PLAN_MAX_TASKS_PER_PROPOSAL=12, PLAN_NEAR_TERM_DAYS=9)
+    def test_limits_are_runtime_configuration_and_prompt_uses_same_values(self):
+        import json
+        from config.policies import render_prompt
+        from ai.prompts.task_planning_prompt import TASK_PLANNING_SYSTEM_PROMPT
+        prompt = render_prompt(TASK_PLANNING_SYSTEM_PROMPT)
+        self.assertIn('4 goals and 12 new tasks', prompt)
+        self.assertIn('next 9 days', prompt)
+        result = self.propose(self.payload(4, 3))
+        self.assertEqual(result.status_code, 201, result.data)
+        applied = self.client.post(f"/api/conversations/plans/{self.plan.pk}/changes/{result.data['change']['id']}/apply/")
+        self.assertEqual(applied.status_code, 200, applied.data)
+        self.assertEqual(Task.objects.count(), 12)
+
+    def test_default_limit_rejects_oversized_batch_but_does_not_cap_total_ambition(self):
+        self.assertEqual(self.propose(self.payload(4, 1)).status_code, 502)
+        for index in range(20):
+            Goal.objects.create(plan=self.plan, user=self.user, title=f'Previous goal {index}')
+        result = self.propose(self.payload(1, 1))
+        self.assertEqual(result.status_code, 201, result.data)
+        applied = self.client.post(f"/api/conversations/plans/{self.plan.pk}/changes/{result.data['change']['id']}/apply/")
+        self.assertEqual(applied.status_code, 200, applied.data)
+        self.assertEqual(self.plan.goals.count(), 21)
+
+    def test_new_intake_has_no_unconditional_question_or_ai_side_effect(self):
+        with patch('conversations.clarification.get_ai_gateway') as gateway:
+            result = self.client.post('/api/plans/', {'text': 'I know arrays; practise graph traversal next.'}, format='json')
+        self.assertEqual(result.status_code, 201)
+        self.assertEqual(result.data['questions'], [])
+        gateway.assert_not_called()
+
+    def test_legacy_upgrade_preserves_work_and_requires_review(self):
+        legacy = Plan.objects.create(user=self.user, title='Old board', raw_input='Learn arrays')
+        goal = Goal.objects.create(plan=legacy, user=self.user, title='Arrays')
+        task = Task.objects.create(goal=goal, title='Practice arrays', estimated_minutes=15,
+                                   readiness='ready', completion_criteria='One tested solution')
+        result = self.client.post(f'/api/plans/{legacy.pk}/upgrade/')
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertEqual(result.data['planning_mode'], 'contextual')
+        task.refresh_from_db()
+        self.assertFalse(self.client.get(f'/api/tasks/{task.pk}/').data['is_schedulable'])
+        self.assertEqual(Goal.objects.filter(pk=goal.pk).count(), 1)
+        self.assertEqual(self.client.post(f'/api/plans/{legacy.pk}/upgrade/').data['version'], result.data['version'])
+
+    def test_confirmed_normalized_rules_need_valid_user_evidence_in_ai_proposals(self):
+        from goals.services import create_plan_change, InvalidPlanOperation
+        with self.assertRaises(InvalidPlanOperation):
+            create_plan_change(self.plan, None, 'Rules', [{'action': 'update_context', 'scheduling_rules': {}}])
+
+    def test_policy_endpoint_returns_only_public_runtime_limits(self):
+        result = self.client.get('/api/policy/')
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.data['plan_max_tasks_per_proposal'], 10)
+        self.assertFalse(any('secret' in key or 'key' in key for key in result.data))
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get('/api/policy/').status_code, 401)
+
+
+class PublishedTaskMutationGuardTests(TestCase):
+    def setUp(self):
+        import uuid
+        from datetime import timedelta
+        from django.utils import timezone
+        from calendars.models import WorkSession
+        from calendars.sessions import snapshot
+        from goals.services import create_plan_revision
+        self.user = User.objects.create_user(email='guard@example.com')
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.plan = Plan.objects.create(user=self.user, title='Legacy board', raw_input='Study')
+        self.goal = Goal.objects.create(plan=self.plan, user=self.user, title='Arrays')
+        Goal.objects.create(plan=self.plan, user=self.user, title='Other goal')
+        self.task = Task.objects.create(goal=self.goal, title='Original', estimated_minutes=30,
+                                        completion_criteria='A solution', readiness='ready')
+        create_plan_revision(self.plan, 'Initial')
+        self.session_fields = {'user': self.user, 'task': self.task, 'status': 'published',
+            'starts_at': timezone.now() + timedelta(days=1), 'ends_at': timezone.now() + timedelta(days=1, hours=1),
+            'expires_at': timezone.now() + timedelta(days=1), 'destination_calendar': 'owned', 'google_sub': 'audit',
+            'google_event_id': uuid.uuid4().hex, 'task_snapshot': snapshot(self.task)}
+
+    def test_legacy_operations_share_guard_and_are_rechecked_at_approval(self):
+        from calendars.models import WorkSession
+        from goals.services import create_plan_change, apply_plan_change, InvalidPlanOperation
+        operation = {'action': 'update_task', 'task_id': str(self.task.pk), 'title': 'Replacement'}
+        change = create_plan_change(self.plan, None, 'Rename', [operation])
+        WorkSession.objects.create(**self.session_fields)
+        with self.assertRaises(InvalidPlanOperation):
+            apply_plan_change(change, self.user)
+        for operation in [operation, {'action': 'delete_task', 'task_id': str(self.task.pk)},
+                          {'action': 'delete_goal', 'goal_id': str(self.goal.pk)},
+                          {'action': 'update_goal', 'goal_id': str(self.goal.pk), 'due_date': '2027-01-01'}]:
+            with self.assertRaises(InvalidPlanOperation):
+                create_plan_change(self.plan, None, 'Change', [operation])
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.title, 'Original')
+        self.assertEqual(self.client.delete(f'/api/{self.goal.pk}/').status_code, 400)
+        self.assertEqual(self.client.post(f'/api/plans/{self.plan.pk}/upgrade/').status_code, 400)
+
+    def test_finished_session_releases_work_but_restored_identity_still_protects(self):
+        from calendars.models import WorkSession
+        from goals.services import create_plan_change, InvalidPlanOperation
+        from django.utils import timezone
+        session = WorkSession.objects.create(**self.session_fields)
+        session.task = None
+        session.save()
+        with self.assertRaises(InvalidPlanOperation):
+            create_plan_change(self.plan, None, 'Rename', [{'action': 'update_task', 'task_id': str(self.task.pk), 'title': 'Changed'}])
+        session.finished_at = timezone.now()
+        session.save()
+        change = create_plan_change(self.plan, None, 'Rename', [{'action': 'update_task', 'task_id': str(self.task.pk), 'title': 'Changed'}])
+        self.assertIsNotNone(change)
+
+
+class TaskProposalRecoveryTests(TestCase):
+    setUp = AuditPlanningRegressionTests.setUp
+    payload = AuditPlanningRegressionTests.payload
+    propose = AuditPlanningRegressionTests.propose
+
+    def test_expired_task_request_reclaims_and_live_attempt_is_fenced(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from conversations.models import Message
+        request = Message.objects.create(conversation=self.plan.conversation, role='user', content='Propose tasks',
+            client_id=self.request['client_id'], metadata={'source': 'task_planning', 'focus': '', 'ai_status': 'pending'},
+            ai_lease_until=timezone.now() + timedelta(minutes=1))
+        result = self.propose(self.payload(1, 1))
+        self.assertEqual(result.status_code, 409, result.data)
+        request.ai_lease_until = timezone.now() - timedelta(seconds=1)
+        request.save()
+        result = self.propose(self.payload(1, 1))
+        self.assertEqual(result.status_code, 201, result.data)
+        request.refresh_from_db()
+        self.assertEqual(request.metadata['ai_status'], 'completed')
+        self.assertEqual(self.propose(self.payload(1, 1)).status_code, 200)
+
+    def test_late_superseded_task_response_cannot_commit_a_proposal(self):
+        import uuid
+        from datetime import timedelta
+        from django.utils import timezone
+        from conversations.models import Message
+        gateway = Mock()
+        new_attempt = uuid.uuid4()
+        def supersede(**kwargs):
+            Message.objects.filter(client_id=self.request['client_id']).update(ai_attempt=new_attempt,
+                ai_lease_until=timezone.now() + timedelta(minutes=1), metadata={'source': 'task_planning', 'focus': '', 'ai_status': 'pending'})
+            return self.payload(1, 1)
+        gateway.generate_json.side_effect = supersede
+        with patch('goals.task_planning.get_ai_gateway', return_value=gateway):
+            result = self.client.post(f'/api/plans/{self.plan.pk}/tasks/propose/', self.request, format='json')
+        self.assertEqual(result.status_code, 409, result.data)
+        self.assertFalse(self.plan.changes.exists())
+        request = Message.objects.get(client_id=self.request['client_id'])
+        self.assertEqual(request.ai_attempt, new_attempt)
+        self.assertEqual(request.metadata['ai_status'], 'pending')

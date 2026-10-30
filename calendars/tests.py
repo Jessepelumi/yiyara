@@ -2038,3 +2038,211 @@ class GoogleReconciliationTests(APITestCase):
         self.assertEqual(self.refresh().data['sync_status'], 'review')
         self.assertEqual(self.move().status_code, 409)
         self.assertFalse(self.writes)
+
+
+class AmbitionSchedulingRulesTests(APITestCase):
+    setUp = TaskSessionTests.setUp
+    freebusy = TaskSessionTests.freebusy
+    propose = TaskSessionTests.propose
+    approve = TaskSessionTests.approve
+
+    def context(self, **fields):
+        self.plan.refresh_from_db()
+        self.plan.planning_mode = 'contextual'
+        self.plan.save()
+        response = self.client.patch(f'/api/plans/{self.plan.pk}/context/',
+            {'plan_version': self.plan.version, **fields}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.plan.refresh_from_db()
+        response = self.client.patch(f'/api/tasks/{self.task.pk}/', {'readiness': 'ready'}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        return response
+
+    def test_prose_constraints_require_confirmation_even_after_task_readiness_review(self):
+        response = self.context(timing='Start next month', constraints=['Only after 15:00'])
+        self.assertFalse(response.data['is_schedulable'])
+        self.assertEqual(self.propose().status_code, 400)
+        plan = self.client.get(f'/api/plans/{self.plan.pk}/').data
+        self.assertTrue(plan['scheduling_rules_review_required'])
+
+    def test_earliest_start_deadline_and_local_hours_are_all_enforced(self):
+        earliest = self.start + timedelta(days=2)
+        self.context(timing='Start after the agreed date', scheduling_rules={
+            'not_before': earliest.isoformat(), 'deadline': (earliest + timedelta(hours=8)).isoformat(),
+            'working_hours': [{'weekday': d, 'start_time': '15:00', 'end_time': '17:00'} for d in range(7)]})
+        self.assertEqual(self.propose().status_code, 409)
+        self.start, self.end = earliest, earliest + timedelta(hours=8)
+        result = self.propose()
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(result.data['starts_at'], self.start.replace(hour=15).isoformat().replace('+00:00', 'Z'))
+        self.assertLessEqual(result.data['ends_at'], self.start.replace(hour=17).isoformat().replace('+00:00', 'Z'))
+
+    def test_ambition_rules_never_override_grey_periods(self):
+        from .models import ProtectedPeriod
+        self.context(constraints=['Only afternoons'], scheduling_rules={'working_hours': [
+            {'weekday': d, 'start_time': '15:00', 'end_time': '17:00'} for d in range(7)]})
+        ProtectedPeriod.objects.create(user=self.user, kind='one_off', starts_at=self.start.replace(hour=15),
+                                       ends_at=self.start.replace(hour=17))
+        self.assertEqual(self.propose().status_code, 409)
+
+    def test_text_edits_invalidate_previous_rules_until_reconfirmed(self):
+        self.context(timing='Start now', scheduling_rules={})
+        self.assertEqual(self.propose().status_code, 201)
+        self.context(timing='Actually start next month')
+        self.assertEqual(self.propose().status_code, 400)
+        self.context(scheduling_rules={'not_before': (self.start + timedelta(days=20)).isoformat()})
+        self.assertEqual(self.propose().status_code, 409)
+
+    def test_rules_are_rechecked_at_approval(self):
+        from .models import WorkSession
+        self.context(scheduling_rules={})
+        result = self.propose()
+        session = WorkSession.objects.get(pk=result.data['id'])
+        self.context(scheduling_rules={'not_before': (self.start + timedelta(days=1)).isoformat()})
+        with patch('calendars.sessions.event_request') as remote:
+            self.assertEqual(self.approve(session).status_code, 409)
+        remote.assert_not_called()
+
+    def test_invalid_rules_are_atomic_and_explicit_offsets_are_required(self):
+        self.plan.planning_mode = 'contextual'
+        self.plan.save()
+        for rules in [
+            {'not_before': '2026-11-01T09:00:00'}, {'unknown': 2},
+            {'not_before': self.end.isoformat(), 'deadline': self.start.isoformat()},
+            {'working_hours': [{'weekday': 8, 'start_time': '09:00', 'end_time': '10:00'}]},
+            {'working_hours': [{'weekday': 0, 'start_time': '09:00', 'end_time': '11:00'},
+                               {'weekday': 0, 'start_time': '10:00', 'end_time': '12:00'}]},
+        ]:
+            result = self.client.patch(f'/api/plans/{self.plan.pk}/context/',
+                {'plan_version': self.plan.version, 'scheduling_rules': rules}, format='json')
+            self.assertEqual(result.status_code, 400, result.data)
+            self.plan.refresh_from_db()
+            self.assertEqual(self.plan.version, 1)
+
+    def test_completed_plan_is_not_schedulable(self):
+        self.plan.planning_state = 'completed'
+        self.plan.save()
+        response = self.client.get(f'/api/tasks/{self.task.pk}/')
+        self.assertFalse(response.data['is_schedulable'])
+        self.assertEqual(self.propose().status_code, 400)
+
+    def test_existing_committed_session_is_reported_as_a_scheduling_blocker(self):
+        from .models import WorkSession
+        result = self.propose()
+        session = WorkSession.objects.get(pk=result.data['id'])
+        with patch('calendars.sessions.event_request', return_value=(201, session.event_payload)):
+            self.assertEqual(self.approve(session).status_code, 200)
+        response = self.client.get(f'/api/tasks/{self.task.pk}/')
+        self.assertFalse(response.data['is_schedulable'])
+        self.assertTrue(any('committed' in item for item in response.data['scheduling_blockers']))
+
+    @override_settings(MIN_SESSION_MINUTES=10, MAX_SESSION_MINUTES=30, SCHEDULE_MAX_RANGE_DAYS=2)
+    def test_runtime_policy_controls_validation_and_search_bounds(self):
+        response = self.client.patch(f'/api/tasks/{self.task.pk}/', {'estimated_minutes': 9}, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.client.patch(f'/api/tasks/{self.task.pk}/', {'estimated_minutes': 31}, format='json').status_code, 400)
+        self.assertEqual(self.client.patch(f'/api/tasks/{self.task.pk}/', {'estimated_minutes': 20}, format='json').status_code, 200)
+        self.end = self.start + timedelta(days=3)
+        self.assertEqual(self.propose().status_code, 400)
+
+    def test_rules_survive_revision_restore_and_then_require_task_review(self):
+        from goals.services import restore_plan_revision
+        self.context(timing='Only afternoons', scheduling_rules={'working_hours': [
+            {'weekday': d, 'start_time': '15:00', 'end_time': '17:00'} for d in range(7)]})
+        self.plan.refresh_from_db()
+        revision = self.plan.revisions.get(version=self.plan.version)
+        self.context(timing='No restriction', scheduling_rules={})
+        restore_plan_revision(revision, self.user)
+        self.plan.refresh_from_db()
+        self.assertEqual(self.plan.context['scheduling_rules']['working_hours'][0]['start_time'], '15:00')
+        self.assertFalse(self.client.get(f'/api/tasks/{self.task.pk}/').data['is_schedulable'])
+
+
+class AmbitionRescheduleRulesTests(APITestCase):
+    setUp = SessionManagementTests.setUp
+    calendar_api = SessionManagementTests.calendar_api
+    provider = SessionManagementTests.provider
+    move = SessionManagementTests.move
+    approve_change = SessionManagementTests.approve_change
+
+    def test_management_and_external_refresh_honour_ambition_hours(self):
+        from goals.scheduling import basis
+        self.plan.context = {'constraints': ['Afternoons only'], 'scheduling_rules': {
+            'working_hours': [{'weekday': d, 'start_time': '15:00', 'end_time': '17:00'} for d in range(7)]}}
+        self.plan.context['scheduling_rules_basis'] = basis(self.plan.context)
+        self.plan.save()
+        result = self.move(time_min=self.start.isoformat(), time_max=self.start.replace(hour=17).isoformat())
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(result.data['change']['starts_at'][11:13], '15')
+        self.assertEqual(self.approve_change(result).status_code, 200)
+        self.assertEqual(len(self.writes), 1)
+        self.event['start'] = {'dateTime': self.start.isoformat()}
+        self.event['end'] = {'dateTime': (self.start + timedelta(hours=1)).isoformat()}
+        self.event['etag'] = '"outside-rules"'
+        refreshed = self.client.post(f'/api/sessions/{self.session.pk}/refresh/')
+        self.assertEqual(refreshed.status_code, 200)
+        self.assertEqual(refreshed.data['sync_status'], 'review')
+        self.assertTrue(any('outside_ambition_rules' in issue for issue in refreshed.data['sync_issues']))
+
+
+
+@override_settings(
+    GOOGLE_CALENDAR_CLIENT_ID='calendar-client', GOOGLE_CALENDAR_CLIENT_SECRET='test-secret',
+    GOOGLE_CALENDAR_REDIRECT_URI='http://localhost:8000/api/calendar/google/callback/',
+    GOOGLE_CALENDAR_ENCRYPTION_KEY=Fernet.generate_key().decode(),
+)
+class CalendarFrontendCallbackTests(APITestCase):
+    setUp = CalendarTests.setUp
+    connect = CalendarTests.connect
+    callback = CalendarTests.callback
+
+    @override_settings(FRONTEND_URL='https://app.example.test/calendar/connected')
+    def test_callback_returns_to_configured_frontend_without_forwarding_credentials(self):
+        query = self.connect()
+        result = self.callback(query)
+        self.assertEqual(result.status_code, 302)
+        self.assertEqual(result['Location'], 'https://app.example.test/calendar/connected')
+        self.assertNotIn('state=', result['Location'])
+        self.assertNotIn('code=', result['Location'])
+        self.assertEqual(result['Referrer-Policy'], 'no-referrer')
+
+    @override_settings(FRONTEND_URL='')
+    def test_postman_still_receives_a_neutral_json_confirmation(self):
+        result = self.callback(self.connect())
+        self.assertEqual(result.status_code, 200)
+        self.assertTrue(result.data['connected'])
+        self.assertNotIn('Postman', result.data['detail'])
+
+
+class AmbitionRuleTimezoneTests(APITestCase):
+    setUp = TaskSessionTests.setUp
+    freebusy = TaskSessionTests.freebusy
+
+    def test_ambition_hours_respect_both_occurrences_of_dst_fallback(self):
+        from datetime import datetime, timezone as utc
+        from .models import SchedulingPreferences
+        from .scheduling import permitted_windows
+        from goals.scheduling import apply_windows, basis
+        profile = SchedulingPreferences.objects.get(user=self.user)
+        profile.timezone = 'Europe/London'
+        profile.working_hours = [{'weekday': 6, 'start_time': '00:00', 'end_time': '03:00'}]
+        profile.save()
+        self.plan.context = {'scheduling_rules': {'working_hours': [{'weekday': 6, 'start_time': '01:00', 'end_time': '01:30'}]}}
+        self.plan.context['scheduling_rules_basis'] = basis(self.plan.context)
+        start, end = datetime(2026, 10, 25, 0, tzinfo=utc.utc), datetime(2026, 10, 25, 3, tzinfo=utc.utc)
+        windows = apply_windows(self.plan, profile, start, end, permitted_windows(self.user, start, end))
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(sum((b-a for a,b in windows), timedelta()), timedelta(hours=1))
+
+    context = AmbitionSchedulingRulesTests.context
+    propose = TaskSessionTests.propose
+
+    def test_clearing_prose_requires_explicit_review_of_previous_calendar_rules(self):
+        self.context(timing='Start later', scheduling_rules={'not_before': (self.start + timedelta(days=1)).isoformat()})
+        self.assertEqual(self.propose().status_code, 409)
+        self.context(timing='', constraints=[])
+        result = self.client.get(f'/api/plans/{self.plan.pk}/')
+        self.assertTrue(result.data['scheduling_rules_review_required'])
+        self.assertEqual(self.propose().status_code, 400)
+        self.context(scheduling_rules={})
+        self.assertEqual(self.propose().status_code, 201)

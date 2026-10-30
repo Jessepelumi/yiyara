@@ -7,9 +7,8 @@ from rest_framework.test import APIClient
 
 from ai.providers.base import AIUnavailableError
 from conversations.models import Conversation, Message
-from goals.models import Goal, PlanChange, PlanRevision
+from goals.models import Goal, Plan, PlanChange, PlanRevision
 from tasks.models import Task
-from workflow.ai_engine import YiyaraWorkflow
 
 
 User = get_user_model()
@@ -44,18 +43,14 @@ DECOMPOSITION = [
 
 
 class StubGateway:
-    def __init__(self, decomposition=None, plan_response=None, error=None):
-        self.decomposition = decomposition
+    def __init__(self, plan_response=None, error=None):
         self.plan_response = plan_response
         self.error = error
 
     def generate_json(self, *, task, **kwargs):
         if self.error:
             raise self.error
-        if str(task) == "goal_decomposition":
-            payload = self.decomposition
-        else:
-            payload = self.plan_response
+        payload = self.plan_response
         validator = kwargs.get("validator")
         return validator(payload) if validator else payload
 
@@ -64,9 +59,18 @@ class PlanConversationApiTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user(email="owner@example.com")
         self.other_user = User.objects.create_user(email="other@example.com")
-        self.plan = YiyaraWorkflow(
-            gateway=StubGateway(decomposition=DECOMPOSITION)
-        ).create_plan_from_ai(self.user, "Build a freelance business")
+        # Stored legacy boards remain readable and editable after route retirement.
+        self.plan = Plan.objects.create(user=self.user, title='Freelance business', raw_input='Build a freelance business')
+        for item in DECOMPOSITION:
+            goal = Goal.objects.create(plan=self.plan, user=self.user,
+                                      title=item['title'], description=item['description'],
+                                      due_date=item['due_date'], raw_input=self.plan.raw_input)
+            for task in item['tasks']:
+                Task.objects.create(goal=goal, **task)
+        conversation = Conversation.objects.create(plan=self.plan, user=self.user)
+        Message.objects.create(conversation=conversation, role='assistant', content='Saved legacy board.')
+        from goals.services import create_plan_revision
+        create_plan_revision(self.plan, 'Initial legacy board')
         self.goal = self.plan.goals.order_by("created_at").first()
         self.task = self.goal.tasks.first()
         self.client = APIClient()
@@ -261,3 +265,111 @@ class PlanConversationApiTests(TestCase):
                 metadata__request_client_id=str(client_id),
             ).exists()
         )
+
+
+class AIRequestRecoveryTests(TestCase):
+    def setUp(self):
+        from django.core.cache import cache
+        from goals.planning import create_ambition
+        cache.clear()
+        self.user = User.objects.create_user(email='ai-recovery@example.com')
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.plan = create_ambition(self.user, 'Learn arrays')
+        self.url = f'/api/conversations/plans/{self.plan.pk}/messages/'
+        self.data = {'content': 'I already know Python loops.', 'client_id': str(uuid.uuid4()), 'plan_version': self.plan.version}
+
+    def pending(self, **fields):
+        from django.utils import timezone
+        from datetime import timedelta
+        return Message.objects.create(conversation=self.plan.conversation, role='user', content=self.data['content'],
+            client_id=self.data['client_id'], metadata={'ai_status': 'pending'},
+            ai_attempt=uuid.uuid4(), ai_lease_until=timezone.now() - timedelta(seconds=1), **fields)
+
+    def gateway(self):
+        from unittest.mock import Mock
+        gateway = Mock()
+        gateway.generate_json.return_value = {'reply': 'Please confirm your desired outcome.', 'summary': 'Clarify', 'changes': []}
+        return gateway
+
+    def test_expired_request_retries_same_message_and_replays_once(self):
+        message = self.pending()
+        gateway = self.gateway()
+        with patch('conversations.clarification.get_ai_gateway', return_value=gateway):
+            result = self.client.post(self.url, self.data, format='json')
+            self.assertEqual(result.status_code, 201, result.data)
+            replay = self.client.post(self.url, self.data, format='json')
+        self.assertEqual(replay.status_code, 200, replay.data)
+        self.assertEqual(gateway.generate_json.call_count, 1)
+        self.assertEqual(Message.objects.filter(client_id=self.data['client_id']).count(), 1)
+        message.refresh_from_db()
+        self.assertEqual(message.metadata['ai_status'], 'completed')
+        self.assertIsNone(message.ai_lease_until)
+
+    def test_live_request_returns_409_instead_of_an_empty_success(self):
+        from django.utils import timezone
+        from datetime import timedelta
+        message = self.pending()
+        message.ai_lease_until = timezone.now() + timedelta(minutes=1)
+        message.save()
+        with patch('conversations.clarification.get_ai_gateway') as gateway:
+            result = self.client.post(self.url, self.data, format='json')
+        self.assertEqual(result.status_code, 409)
+        gateway.assert_not_called()
+
+    def test_pre_migration_pending_message_can_recover_after_lease_duration(self):
+        from django.utils import timezone
+        from datetime import timedelta
+        message = self.pending()
+        Message.objects.filter(pk=message.pk).update(ai_attempt=None, ai_lease_until=None, created_at=timezone.now() - timedelta(days=1))
+        with patch('conversations.clarification.get_ai_gateway', return_value=self.gateway()):
+            self.assertEqual(self.client.post(self.url, self.data, format='json').status_code, 201)
+
+    def test_superseded_attempt_cannot_save_output_or_mark_new_attempt_failed(self):
+        from django.utils import timezone
+        from datetime import timedelta
+        message = self.pending()
+        new_attempt = uuid.uuid4()
+        gateway = self.gateway()
+        def supersede(**kwargs):
+            Message.objects.filter(pk=message.pk).update(ai_attempt=new_attempt,
+                ai_lease_until=timezone.now() + timedelta(minutes=1), metadata={'ai_status': 'pending', 'new_attempt': True})
+            return {'reply': 'Old response', 'summary': 'Old attempt', 'changes': []}
+        gateway.generate_json.side_effect = supersede
+        with patch('conversations.clarification.get_ai_gateway', return_value=gateway):
+            result = self.client.post(self.url, self.data, format='json')
+        self.assertEqual(result.status_code, 409, result.data)
+        message.refresh_from_db()
+        self.assertEqual(message.ai_attempt, new_attempt)
+        self.assertTrue(message.metadata['new_attempt'])
+        self.assertEqual(message.metadata['ai_status'], 'pending')
+        self.assertFalse(self.plan.conversation.messages.filter(role='assistant').exists())
+
+    def test_replayed_change_uses_current_status(self):
+        import json
+        from unittest.mock import Mock
+        gateway = Mock()
+        def generate(**kwargs):
+            source = json.loads(kwargs['prompt'])['current_user_message_id']
+            return {'reply': 'Review starting point', 'summary': 'Starting point', 'changes': [
+                {'action': 'update_context', 'starting_point': self.data['content'], 'source_message_id': source}]}
+        gateway.generate_json.side_effect = generate
+        with patch('conversations.clarification.get_ai_gateway', return_value=gateway):
+            result = self.client.post(self.url, self.data, format='json')
+            self.assertEqual(result.status_code, 201, result.data)
+            applied = self.client.post(f"/api/conversations/plans/{self.plan.pk}/changes/{result.data['change']['id']}/apply/")
+            self.assertEqual(applied.status_code, 200)
+            replay = self.client.post(self.url, self.data, format='json')
+        self.assertEqual(replay.data['change']['status'], 'applied')
+
+    def test_legacy_message_processing_also_recovers_expired_requests(self):
+        from goals.models import Plan
+        self.plan.planning_mode = 'legacy'
+        self.plan.save()
+        message = self.pending()
+        gateway = StubGateway(plan_response={'reply': 'Review the board.', 'summary': 'Advice', 'changes': []})
+        with patch('conversations.services.get_ai_gateway', return_value=gateway):
+            result = self.client.post(self.url, self.data, format='json')
+        self.assertEqual(result.status_code, 201, result.data)
+        message.refresh_from_db()
+        self.assertEqual(message.metadata['ai_status'], 'completed')
