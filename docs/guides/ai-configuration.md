@@ -1,108 +1,46 @@
-# AI Configuration Guide
+# AI configuration and recovery
 
-This guide explains how to configure AI providers for the Yiyara project.
+## Provider configuration
 
-## Supported AI Providers
+The current settings configure Gemini through `GEMINI_API_KEY` and `GEMINI_MODEL`.
+Select a model available to your account. Restart/recreate the service as described
+in [setup](setup.md) after configuration changes.
 
-Yiyara currently supports:
+`AI_PROVIDER_ORDER` supplies the default route order. `AI_PLAN_ITERATION_PROVIDERS`
+controls clarification/conversations and `AI_TASK_PLANNING_PROVIDERS` controls task
+generation/replanning. Each is a comma-separated provider-name list.
 
-- Google Gemini (primary)
-- OpenAI ChatGPT (alternative)
+Changing the order alone does not add a provider. Register its backend class and
+options in `AI_PROVIDERS` in [settings](../../config/settings.py). Only Gemini is
+registered there currently. `OpenAICompatibleProvider` is an available adapter,
+not an automatically enabled integration. Providers implement
+`generate(GenerationRequest) → GenerationResult`; workflows use the shared gateway.
 
-## Google Gemini Setup
+## Execution
 
-### 1. Obtain API Key
+Calls are synchronous, schema/domain validated and bounded by per-attempt and total
+timeouts. Transient failures receive jittered retries, followed by configured
+fallback when available. Defaults and environment names are defined once in
+[settings](../../config/settings.py): see `AI_*`, `PLAN_*`, `CONVERSATION_HISTORY_LIMIT`
+and `OUTCOME_HISTORY_LIMIT`. Prompts consume the shared policy rather than separate
+limits. `GET /api/policy/` exposes the subset needed by clients.
 
-1. Visit [Google AI Studio](https://makersuite.google.com/app/apikey)
-2. Sign in with your Google account
-3. Create a new API key
-4. Copy the API key
+Generation produces reviewable changes; it never authorizes Calendar writes.
+Validation rejects malformed or unsafe operations but cannot prove that every task
+is useful. Review the action, effort, prerequisites and completion criteria.
 
-### 2. Configure Environment
+## Request identity and recovery
 
-Add to your `.env` file:
+Use a UUID `client_id` per logical AI request. Preserve it, content and focus for an
+exact retry; use a new UUID for new work. A live attempt returns 409. After its
+lease expires the saved request can be reclaimed with the same ID and current plan
+version. Completed requests replay the saved result instead of calling AI again;
+late superseded attempts cannot commit.
 
-```env
-GEMINI_API_KEY=your-gemini-api-key-here
-```
+`AI_REQUEST_LEASE_SECONDS` must exceed the total AI timeout. There is no durable job
+queue or background worker; process interruption requires a client retry.
 
-### 3. Verify Configuration
-
-The backend will automatically use Gemini for:
-
-- Goal decomposition
-- Task generation
-- SMART goal creation
-
-## OpenAI ChatGPT Setup (Optional)
-
-### 1. Obtain API Key
-
-1. Visit [OpenAI Platform](https://platform.openai.com/api-keys)
-2. Sign in or create an account
-3. Generate a new API key
-4. Copy the API key
-
-### 2. Configure Environment
-
-Add to your `.env` file:
-
-```env
-OPENAI_API_KEY=your-openai-api-key-here
-```
-
-### 3. Switch Provider (if needed)
-
-Currently, the system defaults to Gemini. To use ChatGPT, modify the AI engine configuration in `backend/workflow/ai_engine.py`.
-
-## Testing AI Features
-
-### Goal Processing Test
-
-1. Start the application: `make up`
-2. Access the frontend at http://localhost:3000
-3. Create a new goal with natural language
-4. Verify that AI processes it into SMART goals and tasks
-
-### API Test
-
-Test the AI processing endpoint:
-
-```bash
-curl -X POST http://localhost:8000/api/goals/ \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your-jwt-token" \
-  -d '{"title": "Learn Python", "description": "I want to become proficient in Python programming"}'
-```
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Invalid API Key**: Check that the key is correct and has proper permissions
-2. **Rate Limits**: Monitor API usage in your provider dashboard
-3. **Network Issues**: Ensure the backend can reach the AI provider APIs
-4. **Model Availability**: Verify the requested model is available in your region
-
-### Error Messages
-
-- `API key not found`: Check `.env` file and restart services
-- `Quota exceeded`: Upgrade your API plan or wait for reset
-- `Model not available`: Try a different model or region
-
-## Best Practices
-
-- Keep API keys secure and never commit to version control
-- Monitor API usage to avoid unexpected costs
-- Use environment-specific keys (dev/staging/prod)
-- Implement rate limiting in your application
-- Cache AI responses where appropriate to reduce API calls
-
-## Advanced Configuration
-
-For custom AI behavior, modify:
-
-- `backend/ai/providers/gemini_provider.py` - Gemini integration
-- `backend/ai/providers/chatgpt_provider.py` - ChatGPT integration
-- `backend/workflow/ai_engine.py` - Main AI orchestration logic</content>
-  <parameter name="filePath">/Users/jeolad/Documents/yiyara/docs/guides/ai-configuration.md
+A 502 `plan_iteration_failed` or `task_planning_failed` can mean provider failure,
+timeout or validation failure. The saved message is retained. Retry the same ID;
+if repeated, inspect `docker compose logs backend`. A 503 `ai_not_configured` means
+no usable configured route/provider. Do not log raw prompts, tokens or credentials.
