@@ -28,7 +28,7 @@ into the JSON file.
 | --- | --- |
 | Start Calendar connection → Check Calendar connection | Skip start if connected; otherwise open authorization_url in the browser and complete consent |
 | List calendars → Select source and destination calendar | Put an actual owned calendar ID in calendar_id; include other busy calendars as sources if needed |
-| Save timezone and working hours → Add lunch grey period | Review before sending; these persist real settings. Send grey-period creation once or skip an existing rule |
+| Save scheduling timezone → Add lunch grey period | Review before sending; timezone and protected periods persist; there is no global allowed-hours setting. Send grey-period creation once or skip an existing rule |
 | Save ambition | Creates a new test plan; its script resets this run's IDs |
 | Ask AI to clarify → Apply reviewed context/questions | Inspect reply and change.operations; apply only a correct non-null change |
 | Inspect full plan and questions | Answer actual open required questions with Optional — Answer a required question; otherwise skip it |
@@ -67,3 +67,18 @@ the collection owns the executable end-to-end examples.
 - Optional — Delete test grey period removes only this run's saved grey period.
   To remove a Google test event, use [session cancellation](sessions.md#reschedule-or-cancel)
   or delete it in Google and refresh. No automatic event cleanup is performed.
+
+## Optional new-task and conflict-review branches
+
+After creating a goal, use Optional — Add your own task, Optional — Review user-added
+tasks, then Optional — Apply task-list review if you accept its suggested changes.
+A null change needs no approval; read the assessment. These requests use separate
+user_task_id and review_client_id variables.
+
+For a manual time, set selected_start and use Optional — Propose user-selected time.
+Inspect conflicts before Optional — Confirm selected-time exception. To test a new
+grey period, edit Add lunch grey period to the desired period. If it returns the
+impact-review 409, read affected_sessions, set grey_resolution to keep or review,
+and send Optional — Confirm grey-period impact. No event is moved by saving it.
+The [Calendar guide](calendar.md#impact-review-when-creating-or-editing-a-grey-period)
+explains selecting individual appointments to keep.

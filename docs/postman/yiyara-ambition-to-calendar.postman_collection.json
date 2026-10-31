@@ -119,6 +119,41 @@
       "key": "protected_period_id",
       "value": "",
       "type": "string"
+    },
+    {
+      "key": "goal_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "user_task_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "review_client_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "selected_start",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "impact_token",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "grey_resolution",
+      "value": "review",
+      "type": "string"
+    },
+    {
+      "key": "pending_grey_period_body",
+      "value": "",
+      "type": "string"
     }
   ],
   "item": [
@@ -313,7 +348,7 @@
       ]
     },
     {
-      "name": "Save timezone and working hours",
+      "name": "Save scheduling timezone",
       "request": {
         "method": "PUT",
         "header": [
@@ -323,10 +358,10 @@
           }
         ],
         "url": "{{base_url}}/api/calendar/scheduling-preferences/",
-        "description": "Updates your global scheduling preferences. Adjust timezone and hours before sending; weekday 0 is Monday.",
+        "description": "Set your timezone; scheduling is allowed outside protected grey periods. No global working-hours selection is required.",
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"timezone\": \"Europe/London\",\n  \"working_hours\": [\n    {\n      \"weekday\": 0,\n      \"start_time\": \"09:00\",\n      \"end_time\": \"17:00\"\n    },\n    {\n      \"weekday\": 1,\n      \"start_time\": \"09:00\",\n      \"end_time\": \"17:00\"\n    },\n    {\n      \"weekday\": 2,\n      \"start_time\": \"09:00\",\n      \"end_time\": \"17:00\"\n    },\n    {\n      \"weekday\": 3,\n      \"start_time\": \"09:00\",\n      \"end_time\": \"17:00\"\n    },\n    {\n      \"weekday\": 4,\n      \"start_time\": \"09:00\",\n      \"end_time\": \"17:00\"\n    }\n  ],\n  \"preferred_session_minutes\": 60\n}",
+          "raw": "{\n  \"timezone\": \"Europe/London\",\n  \"preferred_session_minutes\": 60\n}",
           "options": {
             "raw": {
               "language": "json"
@@ -361,7 +396,7 @@
           }
         ],
         "url": "{{base_url}}/api/calendar/protected-periods/",
-        "description": "Creates a real protected period. Send once, or skip if you already have one. Delete it after testing if unwanted.",
+        "description": "Send once or skip if already protected. If a 409 impact review is returned, inspect affected sessions and use Optional \u2014 Confirm grey-period impact.",
         "body": {
           "mode": "raw",
           "raw": "{\n  \"title\": \"Postman test lunch\",\n  \"kind\": \"weekly\",\n  \"weekdays\": [\n    0,\n    1,\n    2,\n    3,\n    4\n  ],\n  \"start_time\": \"12:00\",\n  \"end_time\": \"13:00\"\n}",
@@ -378,11 +413,11 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "pm.test(\"Expected response status\", () => pm.expect([201]).to.include(pm.response.code));",
-              "if ([201].includes(pm.response.code)) {",
               "const data = pm.response.json();",
-              "pm.collectionVariables.set(\"protected_period_id\", data.id);",
-              "}"
+              "const review = pm.response.code === 409 && data.error === \"protected_period_review_required\";",
+              "pm.test(\"Created or needs impact review\", () => pm.expect(pm.response.code === 201 || review).to.eql(true));",
+              "if (pm.response.code === 201) pm.collectionVariables.set(\"protected_period_id\", data.id);",
+              "if (review) { pm.collectionVariables.set(\"impact_token\", data.impact_token); pm.collectionVariables.set(\"pending_grey_period_body\", pm.variables.replaceIn(pm.request.body.raw)); }"
             ]
           }
         }
@@ -511,6 +546,7 @@
               "const tasks = data.plan.goals.flatMap(g => g.tasks);",
               "const task = tasks.find(t => t.is_schedulable);",
               "pm.collectionVariables.set(\"task_id\", task ? task.id : \"\");",
+              "if (data.plan.goals.length) pm.collectionVariables.set(\"goal_id\", data.plan.goals[0].id);",
               "}"
             ]
           }
@@ -700,6 +736,7 @@
               "const tasks = data.plan.goals.flatMap(g => g.tasks);",
               "const task = tasks.find(t => t.is_schedulable);",
               "pm.collectionVariables.set(\"task_id\", task ? task.id : \"\");",
+              "if (data.plan.goals.length) pm.collectionVariables.set(\"goal_id\", data.plan.goals[0].id);",
               "}"
             ]
           }
@@ -974,6 +1011,236 @@
             "type": "text/javascript",
             "exec": [
               "pm.test(\"Deleted\", () => pm.expect(pm.response.code).to.eql(204));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Optional \u2014 Add your own task",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/tasks/",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "description": "Use an existing goal_id from your plan. Change the sample to your own intent. Saves a draft without calling AI; review it next.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"goal_id\": \"{{goal_id}}\",\n  \"title\": \"Practise negative Python list indices\",\n  \"description\": \"I want to understand accessing list items from the end.\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Created\", () => pm.expect(pm.response.code).to.eql(201));",
+              "if (pm.response.code === 201) { const d=pm.response.json(); pm.collectionVariables.set(\"user_task_id\", d.id); pm.collectionVariables.set(\"plan_version\", d.plan_version); pm.collectionVariables.set(\"review_client_id\", \"\"); }"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Optional \u2014 Review user-added tasks",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/plans/{{plan_id}}/tasks/review/",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "description": "Calls live AI. Read assessment and change.operations. It does not edit tasks or publish events. Keep review_client_id for retries; clear it for a new selection or focus.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"plan_version\": {{plan_version}},\n  \"client_id\": \"{{review_client_id}}\",\n  \"task_ids\": [\"{{user_task_id}}\"],\n  \"focus\": \"Review how my addition fits the ambition, its dependencies and effort. Preserve my intent and propose useful clarifications or edits.\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (!pm.collectionVariables.get(\"review_client_id\") || pm.collectionVariables.get(\"review_client_id\") === \"{$guid}\") pm.collectionVariables.set(\"review_client_id\", pm.variables.replaceIn(\"{{$guid}}\"));"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Review returned\", () => pm.expect([200,201]).to.include(pm.response.code));",
+              "if ([200,201].includes(pm.response.code)) { const d=pm.response.json(); pm.collectionVariables.set(\"change_id\", d.change ? d.change.id : \"\"); }"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Optional \u2014 Apply task-list review",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/conversations/plans/{{plan_id}}/changes/{{change_id}}/apply/",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "description": "Only apply a non-null task review after inspecting it. The user-added task is selected for subsequent inspection.",
+        "body": {
+          "mode": "raw",
+          "raw": "{}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Review applied\", () => pm.expect(pm.response.code).to.eql(200));",
+              "if (pm.response.code === 200) { const d=pm.response.json(); pm.collectionVariables.set(\"plan_version\", d.plan.version); pm.collectionVariables.set(\"task_id\", pm.collectionVariables.get(\"user_task_id\")); }"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Optional \u2014 Propose user-selected time",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/tasks/{{task_id}}/sessions/propose/",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "description": "Set selected_start to an explicit offset-bearing timestamp inside the search range. This requests that exact time. Grey/busy conflicts require separate confirmation; activity/deadline/in-flight constraints remain enforced.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"time_min\": \"{{time_min}}\",\n  \"time_max\": \"{{time_max}}\",\n  \"preferred_start\": \"{{selected_start}}\",\n  \"conflict_policy\": \"ask\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Selected time proposed\", () => pm.expect(pm.response.code).to.eql(201));",
+              "if (pm.response.code === 201) { const d=pm.response.json(); pm.collectionVariables.set(\"session_id\", d.id); pm.collectionVariables.set(\"conflict_token\", d.conflict_token); }"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Optional \u2014 Confirm selected-time exception",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/sessions/{{session_id}}/approve/",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "description": "REAL GOOGLE WRITE. Send only after explicitly accepting every listed personal conflict. Does not remove grey periods or other events; approval is session-specific.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"allow_overlap\": true,\n  \"conflict_token\": \"{{conflict_token}}\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Selected session published\", () => pm.expect(pm.response.code).to.eql(200));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Optional \u2014 Confirm grey-period impact",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/calendar/protected-periods/",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "description": "After an impact-review 409 from Add lunch grey period, set grey_resolution to keep or review and inspect affected sessions before sending. Saves the grey period with explicit decisions; no Google event is moved.",
+        "body": {
+          "mode": "raw",
+          "raw": "{{confirmed_grey_period_body}}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const raw=pm.collectionVariables.get(\"pending_grey_period_body\");",
+              "if (!raw || !pm.collectionVariables.get(\"impact_token\")) throw new Error(\"Request and inspect a protected-period impact review first.\");",
+              "const body=JSON.parse(raw); body.impact_token=pm.collectionVariables.get(\"impact_token\"); body.conflict_resolution=pm.collectionVariables.get(\"grey_resolution\");",
+              "pm.variables.set(\"confirmed_grey_period_body\", JSON.stringify(body));"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"Protected period saved\", () => pm.expect(pm.response.code).to.eql(201));",
+              "if (pm.response.code === 201) pm.collectionVariables.set(\"protected_period_id\", pm.response.json().id);"
             ]
           }
         }
