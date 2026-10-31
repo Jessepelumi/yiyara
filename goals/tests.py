@@ -1216,3 +1216,181 @@ class TaskProposalRecoveryTests(TestCase):
         request = Message.objects.get(client_id=self.request['client_id'])
         self.assertEqual(request.ai_attempt, new_attempt)
         self.assertEqual(request.metadata['ai_status'], 'pending')
+
+
+class ActivityTaskPlanningTests(TestCase):
+    setUp = ActionableTaskPlanningTests.setUp
+    propose = ActionableTaskPlanningTests.propose
+    apply = ActionableTaskPlanningTests.apply
+
+    def availability(self):
+        source = Message.objects.create(conversation=self.plan.conversation, role='user',
+            content='My tutor confirmed Saturdays from 10:00 to 12:00.')
+        return {'status': 'confirmed', 'rules': {'working_hours': [
+            {'weekday': 5, 'start_time': '10:00', 'end_time': '12:00'}]},
+            'evidence': [{'source_message_id': str(source.pk), 'quote': source.content}]}
+
+    def test_generated_activity_rules_are_persisted_with_review_and_rechecked(self):
+        self.payload['goals'][0]['tasks'][0]['availability'] = self.availability()
+        result, _ = self.propose()
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertFalse(Task.objects.exists())
+        applied = self.apply(result)
+        self.assertEqual(applied.status_code, 200, applied.data)
+        self.assertEqual(Task.objects.get(title='Trace array indexing in Python').availability['status'], 'confirmed')
+
+    def test_model_cannot_fabricate_activity_evidence_or_mark_unknown_ready(self):
+        first = self.payload['goals'][0]['tasks'][0]
+        first['availability'] = self.availability()
+        first['availability']['evidence'][0]['quote'] = 'Invented opening times'
+        result, _ = self.propose()
+        self.assertEqual(result.status_code, 502)
+        self.assertFalse(Task.objects.exists())
+        first['availability'] = {'status': 'unknown', 'reason': 'Teaching slots not confirmed.'}
+        result, _ = self.propose()
+        self.assertEqual(result.status_code, 502)
+        first.update(readiness='blocked', blocker_reason='Teaching slots not confirmed.')
+        result, _ = self.propose()
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(self.apply(result).status_code, 200)
+        task = Task.objects.get(title=first['title'])
+        detail = self.client.get(f'/api/tasks/{task.pk}/')
+        self.assertFalse(detail.data['is_schedulable'])
+
+    def test_approval_revalidates_activity_evidence(self):
+        first = self.payload['goals'][0]['tasks'][0]
+        first['availability'] = self.availability()
+        result, _ = self.propose()
+        self.assertEqual(result.status_code, 201)
+        Message.objects.filter(pk=first['availability']['evidence'][0]['source_message_id']).update(content='Corrected: those times are not confirmed.')
+        self.assertEqual(self.apply(result).status_code, 400)
+        self.assertFalse(Task.objects.exists())
+
+
+class ActivityReplanningTests(TestCase):
+    setUp = TaskReplanningTests.setUp
+    propose = TaskReplanningTests.propose
+    apply = TaskReplanningTests.apply
+
+    def test_replanning_cannot_make_unknown_activity_ready(self):
+        self.task.availability = {'status': 'unknown', 'reason': 'Tutor slots not confirmed.'}
+        self.task.readiness = 'draft'
+        self.task.save()
+        result, _ = self.propose()
+        self.assertEqual(result.status_code, 502)
+        self.assertFalse(self.plan.changes.exists())
+
+    def test_confirmation_edit_requires_all_evidence_fields(self):
+        import uuid
+        for evidence in [{'source_message_id': str(uuid.uuid4())}, {'quote': 'Missing source'}]:
+            result = self.client.patch(f'/api/tasks/{self.task.pk}/', {'availability': {
+                'status': 'confirmed', 'rules': {'not_before': '2026-11-01T10:00:00Z'},
+                'evidence': [evidence]}}, format='json')
+            self.assertEqual(result.status_code, 400)
+
+
+class UserTaskReviewTests(TestCase):
+    setUp = TaskReplanningTests.setUp
+
+    def add_user_task(self, **changes):
+        result = self.client.post('/api/tasks/', {'goal_id': str(self.goal.pk), 'title': 'Practise indexing',
+            'description': 'I want to understand negative indices.', **changes}, format='json')
+        self.assertEqual(result.status_code, 201, result.data)
+        self.plan.refresh_from_db()
+        return result
+
+    def review(self, payload=None, data=None, gateway=None):
+        import uuid
+        from unittest.mock import Mock
+        self.plan.refresh_from_db()
+        body = data or {'plan_version': self.plan.version, 'client_id': str(uuid.uuid4()), 'task_ids': [str(self.added['id'])]}
+        payload = payload or {'reply': 'This fits the array goal; review the proposed instructions and effort.',
+            'summary': 'Review user-added practice', 'updates': [{'task_id': str(self.added['id']),
+                'reason': 'Make the requested indexing practice executable.', 'changes': {
+                    'description': 'Create a five-item Python list and print the last two items using negative indices.',
+                    'completion_criteria': 'Script prints the expected two values.', 'estimated_minutes': 30, 'readiness': 'ready'}}],
+            'goals': [], 'assessment': [{'task_id': str(self.added['id']), 'fit': 'aligned',
+                                       'reason': 'Builds on the saved Python starting point.', 'related_task_ids': []}]}
+        gateway = gateway or StubGateway(payload)
+        with patch('goals.task_planning.get_ai_gateway', return_value=gateway) as configured:
+            result = self.client.post(f'/api/plans/{self.plan.pk}/tasks/review/', body, format='json')
+        return result, body, configured
+
+    def test_user_addition_is_saved_then_reviewed_without_silent_mutation(self):
+        from tasks.models import Task
+        self.added = self.add_user_task().data
+        self.assertTrue(self.added['review_recommended'])
+        self.assertEqual(self.added['plan_version'], self.plan.version)
+        result, body, _ = self.review()
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(result.data['assessment'][0]['fit'], 'aligned')
+        task = Task.objects.get(pk=self.added['id'])
+        self.assertEqual(task.readiness, 'draft')
+        self.assertEqual(task.description, 'I want to understand negative indices.')
+        approved = self.client.post(f"/api/conversations/plans/{self.plan.pk}/changes/{result.data['change']['id']}/apply/")
+        self.assertEqual(approved.status_code, 200, approved.data)
+        task.refresh_from_db()
+        self.assertEqual(task.readiness, 'ready')
+        self.assertEqual(task.estimated_minutes, 30)
+        with patch('goals.task_planning.get_ai_gateway') as provider:
+            replay = self.client.post(f'/api/plans/{self.plan.pk}/tasks/review/', body, format='json')
+        self.assertEqual(replay.status_code, 200, replay.data)
+        self.assertEqual(replay.data['change']['status'], 'applied')
+        self.assertEqual(replay.data['assessment'], result.data['assessment'])
+        provider.assert_not_called()
+
+    def test_unrelated_task_can_receive_assessment_without_an_edit_proposal(self):
+        self.added = self.add_user_task(title='Plan a holiday').data
+        payload = {'reply': 'This appears to belong to a separate ambition. Keep it here or create another plan?',
+            'summary': 'Review scope', 'updates': [], 'goals': [], 'assessment': [
+                {'task_id': str(self.added['id']), 'fit': 'unrelated', 'reason': 'Travel planning does not advance array practice.', 'related_task_ids': []}]}
+        result, _, _ = self.review(payload)
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertIsNone(result.data['change'])
+        self.assertEqual(Task.objects.get(pk=self.added['id']).title, 'Plan a holiday')
+
+    def test_review_rejects_cross_plan_ids_and_incomplete_or_out_of_scope_assessments(self):
+        import uuid
+        self.added = self.add_user_task().data
+        result, _, provider = self.review(data={'plan_version': self.plan.version, 'client_id': str(uuid.uuid4()), 'task_ids': [str(uuid.uuid4())]})
+        self.assertEqual(result.status_code, 400)
+        provider.assert_not_called()
+        payload = {'reply': 'Review', 'summary': 'Review', 'updates': [], 'goals': [], 'assessment': []}
+        self.assertEqual(self.review(payload)[0].status_code, 502)
+        payload['assessment'] = [{'task_id': str(self.added['id']), 'fit': 'aligned', 'reason': 'Fits', 'related_task_ids': []}]
+        payload['updates'] = [{'task_id': str(self.task.pk), 'reason': 'Unselected task', 'changes': {'title': 'Changed'}}]
+        self.assertEqual(self.review(payload)[0].status_code, 502)
+
+    def test_changed_list_invalidates_review_approval(self):
+        self.added = self.add_user_task().data
+        result, _, _ = self.review()
+        self.assertEqual(result.status_code, 201, result.data)
+        self.add_user_task(title='Another user action')
+        approved = self.client.post(f"/api/conversations/plans/{self.plan.pk}/changes/{result.data['change']['id']}/apply/")
+        self.assertEqual(approved.status_code, 409)
+        self.assertEqual(Task.objects.get(pk=self.added['id']).readiness, 'draft')
+
+    def test_review_uses_shared_recovery_and_rejects_client_id_reuse_for_new_selection(self):
+        from unittest.mock import Mock
+        from conversations.models import Message
+        from django.utils import timezone
+        from datetime import timedelta
+        import uuid
+        self.added = self.add_user_task().data
+        body = {'plan_version': self.plan.version, 'client_id': str(uuid.uuid4()), 'task_ids': [str(self.added['id'])]}
+        result, _, _ = self.review(data=body, gateway=StubGateway(error=RuntimeError('provider unavailable')))
+        self.assertEqual(result.status_code, 502)
+        result, _, _ = self.review(data=body)
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(Message.objects.filter(client_id=body['client_id']).count(), 1)
+        changed = self.client.post(f'/api/plans/{self.plan.pk}/tasks/review/', {**body, 'task_ids': [str(self.task.pk)]}, format='json')
+        self.assertEqual(changed.status_code, 409)
+
+    def test_review_authentication_and_owner_isolation(self):
+        self.added = self.add_user_task().data
+        self.client.force_authenticate(None)
+        result, _, _ = self.review()
+        self.assertEqual(result.status_code, 401)
+        self.client.force_authenticate(User.objects.create_user(email='review-outsider@example.com'))
+        result, _, _ = self.review()
+        self.assertEqual(result.status_code, 404)
