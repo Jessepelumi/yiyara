@@ -58,7 +58,10 @@ Timing prose alone is not executable. Confirm its interpretation through
 This example permits **Monday only**; include all intended weekdays. Hours use the
 saved [Calendar timezone](calendar.md#availability-rules), and timestamp boundaries
 require offsets. `deadline` is exclusive. Null working_hours adds no restriction;
-`[]` permits no time. Rules narrow global availability; they never override it.
+`[]` permits no time. Rules narrow time outside grey periods; only the explicit
+[session exception flow](sessions.md#user-selected-times-and-exceptions) can override personal grey periods.
+Use ambition-wide rules only for restrictions that apply to every task. A lesson-only
+preference belongs on the lesson task, not on research or paperwork tasks.
 Confirm `{}` only when the prose adds no calendar restriction. Clarify unsupported
 constraints rather than pretending they are enforced.
 
@@ -90,6 +93,56 @@ unconfirmed timing and unfinished commitments can all prevent scheduling.
 The default proposal limits apply **per batch**, not to the whole ambition; see
 [AI policy configuration](ai-configuration.md#execution). Additional proposals can
 add work under existing goals without duplicating unfinished tasks.
+
+## Review user-added tasks
+
+Manual task creation preserves the user's input immediately and returns plan_version
+and review_recommended=true. It makes no model call. Then request:
+
+`POST /api/plans/{plan_id}/tasks/review/`
+
+Body: latest plan_version, UUID client_id, optional focus and task_ids. If task_ids
+is omitted, all plan tasks are selected only when the list fits one configured review
+batch; otherwise select a subset. Each assessment contains task_id, fit, reason and
+related_task_ids. Fit is aligned, unclear, unrelated, duplicate or needs_clarification.
+The full plan informs fit/dependencies, but proposed edits target only selected tasks.
+
+The response includes assessment, reviewed_task_ids and the usual reviewable change
+(or null when advice needs no edits). Apply/reject uses the existing planning routes.
+Task intent, progress and Calendar events remain unchanged until the relevant approval;
+completed/committed work remains protected. New edits invalidate stale review proposals.
+Same-ID retries replay assessments and current change status; a different selection
+or focus needs a new UUID. The frontend can show “Reviewing your task list…” while
+this synchronous request runs. An unrelated task should prompt a scope decision,
+not be silently rewritten to match the ambition.
+
+## Activity-specific availability
+
+Tasks expose `availability` independently of personal grey periods:
+
+- `unrestricted` (or an older empty object): no external timing requirement.
+- `unknown`: required activity hours/slots are missing; reason is required and the
+  task cannot be scheduled, even if another path changes its readiness.
+- `confirmed`: time rules plus evidence quoting user messages in this plan. These
+  restrict only that task and are rechecked before Calendar writes.
+
+Confirm an activity through `PATCH /api/tasks/{task_id}/` with an availability object:
+
+```json
+{
+  "availability": {
+    "status": "confirmed",
+    "rules": {"working_hours": [{"weekday": 5, "start_time": "10:00", "end_time": "12:00"}]},
+    "evidence": [{"source_message_id": "<user message UUID>", "quote": "<exact user statement confirming lesson hours>"}]
+  }
+}
+```
+
+This is user-reported evidence, not an independently verified provider lookup. An
+instructor's confirmed teaching slots can differ from school opening hours. With no
+research integration, ask for those details or propose obtaining them; never invent
+opening hours. Research/paperwork can remain unrestricted. The AI proposes activity
+availability on new tasks; existing tasks use explicit edits to confirm/correct it.
 
 ## Retrieval and history
 

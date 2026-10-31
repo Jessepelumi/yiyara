@@ -12,9 +12,11 @@ the frontend to that flow is the next priority; it is not yet a verified web exp
 
 - Google sign-in and separate Calendar consent, with encrypted provider credentials.
 - Persistent ambitions, contextual clarification, questions and user-approved task proposals.
-- Actionable tasks with effort, completion criteria, prerequisites and blockers.
+- Actionable tasks with effort, completion criteria, prerequisites and blockers;
+  reviewable AI assessments of user-added tasks.
 - Calendar preferences, timezones and protected grey periods; reviewed session publication.
-- Explicit overlap decisions, duplicate-safe publishing, rescheduling, cancellation
+- User-selected grey/busy exceptions, protected-period impact review, duplicate-safe
+  publishing, rescheduling, cancellation
   and refresh after external Google edits.
 - Partial/completed/blocked/skipped progress, continuation sessions, AI replanning
   and plan revisions that preserve reported work.
@@ -33,7 +35,7 @@ session needs its own approval.
 | --- | --- |
 | [Authentication](docs/guides/authentication.md) | Google identity, application JWTs, refresh and account linking |
 | [Planning](docs/guides/planning.md) | Ambitions, clarification, task proposals, context and revision rules |
-| [Calendar configuration](docs/guides/calendar.md) | OAuth, calendar selection, working hours and grey periods |
+| [Calendar configuration](docs/guides/calendar.md) | OAuth, calendar selection, timezone and grey periods |
 | [Sessions](docs/guides/sessions.md) | Scheduling, publication, conflicts, management and reconciliation |
 | [Progress](docs/guides/progress.md) | Outcomes, finishing sessions, continuation and replanning |
 | [AI configuration](docs/guides/ai-configuration.md) | Provider routing, limits, failures and request recovery |

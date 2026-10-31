@@ -27,7 +27,9 @@ limits. `GET /api/policy/` exposes the subset needed by clients.
 
 Generation produces reviewable changes; it never authorizes Calendar writes.
 Validation rejects malformed or unsafe operations but cannot prove that every task
-is useful. Review the action, effort, prerequisites and completion criteria.
+is useful. Review the action, effort, prerequisites, completion criteria and
+[task activity availability](planning.md#activity-specific-availability). User free
+time does not establish a provider's opening hours or confirmed booking slots.
 
 ## Request identity and recovery
 
