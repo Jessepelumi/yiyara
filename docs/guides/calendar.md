@@ -56,11 +56,18 @@ leaves Google events untouched and does not log the user out of Yiyara.
 
 ## Availability rules
 
-`GET/PUT /api/calendar/scheduling-preferences/` reads/replaces `timezone`,
-`working_hours` and optional `preferred_session_minutes`. Use an IANA timezone;
-weekday 0 is Monday, 6 Sunday. Each working window has weekday/start_time/end_time.
-Times are local minute-precision values; windows cannot overlap or run overnight.
-Split overnight periods. Empty working hours permits no scheduling.
+`GET/PUT /api/calendar/scheduling-preferences/` reads/replaces the IANA `timezone`
+and optional `preferred_session_minutes`. There is no global allowed-hours timetable:
+all time outside the user's grey periods is eligible, including across midnight.
+Users choose their own unavailable time; no office/sleep hours are assumed.
+
+```json
+{"timezone": "Europe/London", "preferred_session_minutes": 60}
+```
+
+The removed global `working_hours` field is rejected with a 400 directing clients
+to protected periods. Existing timezone/grey periods are preserved by migration;
+old allowed hours are removed, not converted into guessed grey periods.
 
 `GET/POST /api/calendar/protected-periods/` lists/creates grey periods.
 `GET/PATCH/DELETE /api/calendar/protected-periods/{id}/` manages one period.
@@ -69,11 +76,33 @@ Split overnight periods. Empty working hours permits no scheduling.
   Optional start_date/end_date bound recurrence.
 - One-off: kind=one_off and offset-bearing starts_at/ends_at; omit recurrence fields.
 
-Grey periods are hard exclusions, including when overlap with ordinary events is
-approved. DST is interpreted in the saved timezone. A preference/grey-period edit
-affects future eligibility checks; it does not automatically move published events.
+Grey periods exclude automatic proposals. Explicit user-selected exceptions follow
+[session conflict review](sessions.md#user-selected-times-and-exceptions). DST is
+interpreted in the saved timezone; no edit automatically moves Google events.
 
-`POST /api/calendar/scheduling-windows/` previews global hours minus grey periods;
+### Impact review when creating or editing a grey period
+
+POST/PATCH checks saved future unfinished published sessions. A conflicting edit
+returns 409 with error=protected_period_review_required, affected_sessions and
+impact_token; nothing is saved yet. Resend the same period fields with that token
+and conflict_resolution:
+
+- keep: save the period and keep existing appointments as session-specific exceptions.
+- review: save the period and flag affected sessions for rescheduling review.
+- Optional keep_session_ids selects specific appointments to keep; remaining ones
+  are flagged for review. Only IDs in the current impact list are accepted.
+
+The response's impact_review lists kept/review session IDs. No Google write happens.
+Changed sessions/rules invalidate the review token. An unconfirmed Calendar write
+must be recovered first. Existing tentative management proposals are invalidated.
+
+`GET /api/calendar/protected-periods/{id}/impacts/` inspects current saved overlaps
+and kept exceptions. A later PATCH can review keep choices again. Impacts use local
+session state and include synced_at; explicitly refresh stale Calendar sessions
+before deciding. Keeping an appointment does not permit other tasks in that grey
+period. Rescheduling it requires its own independent review.
+
+`POST /api/calendar/scheduling-windows/` previews all time minus grey periods;
 it explicitly does **not** check Google busy time or ambition-specific rules.
 `POST /api/calendar/availability/` returns selected calendars' Google busy intervals.
 Both take time_min/time_max; scheduling intersects these with confirmed

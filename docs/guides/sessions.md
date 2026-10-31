@@ -32,22 +32,31 @@ windows. Events are private busy blocks with instructions/completion criteria an
 no attendees. Repeating approval reuses the same event ID. Publication is separate
 from [finishing work](progress.md#finish-and-continue).
 
-## Occupied slots
+## User-selected times and exceptions
 
-`conflict_policy=avoid` returns only free slots. The default ask tries free time,
-then may offer occupied time if nothing free fits. A permitted preferred_start can
-be proposed occupied even when another free slot exists. Grey periods are never
-made overrideable.
+Without preferred_start, every proposal is automatic and uses only free time outside
+all grey periods. No occupied-slot fallback exists, even with conflict_policy=ask.
+A 409 means no suitable free slot fits the supplied range.
 
-When requires_conflict_approval is true, show conflicts and offer a free alternative
-(new proposal with avoid) or explicit overlap. To approve the latter, send:
+Providing preferred_start explicitly requests that exact time. It must fit the range,
+duration, deadlines, task/activity rules and in-flight reservations; the scheduler
+will not silently substitute a different time. With ask it can return conflicts for
+busy events and grey periods. With avoid, any conflict returns 409.
+
+Inspect time_selection, conflicts and requires_conflict_approval. Conflicts identify
+calendar busy windows or kind=grey_period with period ID/version and protected times.
+To confirm a reviewed exception, send:
 
 ```json
 {"allow_overlap": true, "conflict_token": "<token from the reviewed proposal>"}
 ```
 
-Existing events are retained. Changed occupancy requires new review; the token
-cannot authorize a different conflict. Otherwise approve with no body or `{}`.
+The exception belongs to that session/time and the reviewed conflicts only. Existing
+events and grey periods remain intact; new/changed conflicts require fresh review.
+User-approved parallel sessions are supported. Automatic proposals never inherit
+another session's exception. Without conflicts approve with no body or `{}`.
+Personal exceptions cannot establish third-party availability, complete prerequisites
+or bypass an in-flight Calendar operation. The same rules apply to rescheduling.
 
 ## Reschedule or cancel
 
@@ -76,7 +85,8 @@ leases expire. Do not generate replacement writes to recover uncertainty.
 `POST /api/sessions/{session_id}/refresh/` takes no body and reads the linked Google
 event. GET detail reads only saved state. Refresh adopts supported external
 moves/renames, invalidates stale management proposals and records history. Violated
-rules or unsupported formats are flagged for review, not silently repaired.
+rules or unsupported formats are flagged for review, not silently repaired. Refresh
+also retries [completion appearance updates](progress.md#calendar-completion-appearance).
 
 Verified event deletion cancels the local session without completing work or
 recreating Google events. Access failures retain the last known state. A restored

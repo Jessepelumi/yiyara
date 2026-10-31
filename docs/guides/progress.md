@@ -53,6 +53,20 @@ first be explicitly resolved/reopened and eligible. One task cannot have two
 unfinished committed sessions. Outcome reporting is blocked while a relevant
 Calendar management write is uncertain; recover that write first.
 
+## Calendar completion appearance
+
+Confirmed task completion prefixes its published Google events with `✓ Completed: `
+and colours them graphite (`COMPLETED_EVENT_COLOR_ID`, default `8`). Events keep their
+times and identity. Reopening restores the original title and colour. Partial,
+blocked and skipped reports do not mark an event completed. Elapsed time never does.
+
+Progress is saved even if Google is unavailable. Session responses expose
+`task_completed` (for frontend strikethrough) and `completion_presentation.status`
+(`pending`, `current`, or `error`). Retry failed updates through the
+[session refresh endpoint](sessions.md#recovery-and-reconciliation); refresh also
+updates events completed before this feature. Conflicting manual title/colour edits
+are preserved and reported for review. No frontend exists yet.
+
 ## Replan
 
 `POST /api/plans/{plan_id}/replan/` accepts plan_version, UUID client_id and optional
