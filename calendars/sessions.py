@@ -24,7 +24,7 @@ class SessionConflict(APIException):
 def snapshot(task):
     return {"task_id": str(task.pk), "title": task.title, "description": task.description,
             "completion_criteria": task.completion_criteria, "estimated_minutes": task.estimated_minutes,
-            "readiness": task.readiness, "due_date": str(task.due_date) if task.due_date else None,
+            "readiness": task.readiness, "availability": task.availability, "due_date": str(task.due_date) if task.due_date else None,
             "goal_due_date": str(task.goal.due_date) if task.goal.due_date else None,
             "dependencies": sorted(str(pk) for pk in task.dependencies.values_list('pk', flat=True)),
             "blocker_reason": task.blocker_reason, "planning_context_version": task.planning_context_version,
@@ -33,7 +33,7 @@ def snapshot(task):
 
 def matches_snapshot(task, saved):
     # Previously created proposals predate dependency/context fields.
-    return snapshot(task) == {"dependencies": [], "blocker_reason": "", "planning_context_version": None,
+    return snapshot(task) == {"availability": {}, "dependencies": [], "blocker_reason": "", "planning_context_version": None,
                              "remaining_minutes": None, "progress_version": 0, **saved}
 
 
@@ -125,13 +125,16 @@ def propose(user, task_id, start, end, *, preferred_start=None, conflict_policy=
         previous = list(WorkSession.objects.filter(task=task, status='proposed').values_list('pk', flat=True))
         if start >= limit:
             raise SessionConflict('The search range is after the task deadline.')
-        windows, local_busy = conflicts.local_availability(user, start, limit, exclude_sessions=previous)
+        windows, local_busy = conflicts.local_availability(user, start, limit, exclude_sessions=previous, manual=preferred_start is not None)
         from goals.scheduling import apply_windows
         windows = apply_windows(task.goal.plan, preferences, start, limit, windows)
+        from tasks.availability import apply_task_windows
+        windows = apply_task_windows(task, preferences, start, limit, windows)
         if preferred_start is not None and preferred_start + duration > limit:
             raise ValidationError('The preferred session must fit within the search range and deadline.')
         slot = conflicts.select_slot(windows, [*busy, *local_busy], duration, preferred=preferred_start, policy=conflict_policy)
-        occupied = conflicts.reviewed([*busy, *local_busy], *slot)
+        from .scheduling import grey_details
+        occupied = conflicts.reviewed([*busy, *local_busy, *grey_details(user, *slot)], *slot)
         WorkSession.objects.filter(pk__in=previous).update(status='rejected')
         prior = WorkSession.objects.filter(user=user, task_snapshot__task_id=str(task.pk),
                                            finished_at__isnull=False).order_by("-finished_at").first()
@@ -151,6 +154,7 @@ def propose(user, task_id, start, end, *, preferred_start=None, conflict_policy=
             expires_at=min(slot[0], timezone.now() + timedelta(seconds=settings.PROPOSAL_TTL_SECONDS)), destination_calendar=target,
             google_sub=subject, google_event_id=event_id, task_snapshot=original, event_payload=payload,
             continuation_of=prior, source_outcome_id=latest.pk if prior and latest else None,
+            time_selection='manual' if preferred_start is not None else 'automatic',
             conflicts=occupied, conflict_token=conflicts.fingerprint(occupied, *slot),
         )
 
@@ -163,14 +167,18 @@ def ensure_no_other_active(user, session):
 
 def check_publish_window(user, session, details):
     ensure_no_other_active(user, session)
-    allowed, local_busy = conflicts.local_availability(user, session.starts_at, session.ends_at, exclude_sessions=[session.pk])
+    allowed, local_busy = conflicts.local_availability(user, session.starts_at, session.ends_at, exclude_sessions=[session.pk], manual=session.time_selection == 'manual')
     from goals.scheduling import apply_windows
     task = Task.objects.select_related('goal__plan').get(pk=session.task_id)
     profile = SchedulingPreferences.objects.get(user=user)
     allowed = apply_windows(task.goal.plan, profile, session.starts_at, session.ends_at, allowed)
+    from tasks.availability import apply_task_windows
+    allowed = apply_task_windows(task, profile, session.starts_at, session.ends_at, allowed)
     if not any(left <= session.starts_at and right >= session.ends_at for left, right in allowed):
-        raise SessionConflict('This time is protected or reserved by an in-flight operation; it cannot be overridden.')
-    conflicts.check_review(session, conflicts.reviewed([*details, *local_busy], session.starts_at, session.ends_at))
+        raise SessionConflict('This proposal no longer fits its applicable constraints or an in-flight reservation. Request a new automatic or user-selected time.')
+    from .scheduling import grey_details
+    current = [*details, *local_busy, *grey_details(user, session.starts_at, session.ends_at)]
+    conflicts.check_review(session, conflicts.reviewed(current, session.starts_at, session.ends_at))
 
 
 def _event_request(user, session, method, payload, write_state):
@@ -305,7 +313,7 @@ def _approve(user, session_id, allow_overlap=False, conflict_token=''):
         session.status = 'publishing'
         session.approved_at = session.approved_at or now
         session.last_error = ''
-        session.save(update_fields=['status', 'approved_at', 'last_error', 'overlap_approved', 'overlap_history'])
+        session.save(update_fields=['status', 'approved_at', 'last_error', 'overlap_approved', 'overlap_history', 'grey_exceptions'])
     # The intent is committed before contacting Google. Retries always reuse the event ID and payload.
     try:
         status, event = event_request(user, session, 'POST', session.event_payload)
@@ -319,7 +327,7 @@ def _approve(user, session_id, allow_overlap=False, conflict_token=''):
             CalendarConnection.objects.filter(user=user).update(reconnect_required=True)
         updates = {'last_error': 'Publishing is unconfirmed. Retry approval of this same session to reconcile.'}
         if first_attempt and getattr(error, 'before_calendar_insert', False):
-            updates = {'status': 'proposed', 'approved_at': None,
+            updates = {'status': 'proposed', 'approved_at': None, 'grey_exceptions': [],
                        'overlap_approved': False,
                        'last_error': 'No event was submitted. Review this proposal before retrying.'}
         WorkSession.objects.filter(pk=session.pk, status='publishing').update(**updates)

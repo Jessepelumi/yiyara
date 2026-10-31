@@ -1,4 +1,4 @@
-"""Calendar occupancy is negotiable; local rules and in-flight reservations are not."""
+"""Automatic free-slot selection and explicit user-reviewed personal exceptions."""
 import hashlib
 import json
 from datetime import timedelta, timezone as utc_timezone
@@ -10,8 +10,8 @@ from .models import SessionChange, WorkSession
 from .scheduling import permitted_windows, subtract_periods
 
 
-def local_availability(user, start, end, *, exclude_sessions=(), exclude_change=None):
-    allowed = permitted_windows(user, start, end)
+def local_availability(user, start, end, *, exclude_sessions=(), exclude_change=None, manual=False):
+    allowed = permitted_windows(user, start, end, ignore_grey=manual)
     if allowed is None:
         raise ValidationError('Set scheduling preferences first.')
     changes = SessionChange.objects.filter(user=user).exclude(pk=exclude_change)
@@ -31,11 +31,14 @@ def local_availability(user, start, end, *, exclude_sessions=(), exclude_change=
 
 
 def reviewed(details, start, end):
-    grouped = {}
+    grouped, grey = {}, []
     for item in details:
         left, right = max(start, item['start']), min(end, item['end'])
         if left < right:
-            grouped.setdefault(item['calendar_id'], []).append((left, right))
+            if item.get('kind') == 'grey_period':
+                grey.append({**item, 'start': left.astimezone(utc_timezone.utc).isoformat(), 'end': right.astimezone(utc_timezone.utc).isoformat()})
+            else:
+                grouped.setdefault(item['calendar_id'], []).append((left, right))
     result = []
     for calendar, intervals in sorted(grouped.items()):
         merged = []
@@ -46,7 +49,7 @@ def reviewed(details, start, end):
                 merged.append((left, right))
         result.extend({'calendar_id': calendar, 'start': left.astimezone(utc_timezone.utc).isoformat(),
                        'end': right.astimezone(utc_timezone.utc).isoformat()} for left, right in merged)
-    return result
+    return result + sorted(grey, key=lambda item: (item['period_id'] or 0, item['start'], item['end']))
 
 
 def fingerprint(items, start, end):
@@ -69,15 +72,15 @@ def select_slot(allowed, details, duration, *, preferred=None, policy='ask'):
 
     if preferred is not None:
         preferred_slot = (preferred, preferred + duration)
-        if any(left <= preferred and preferred + duration <= right for left, right in allowed):
-            if policy == 'ask' or not reviewed(details, *preferred_slot):
-                return preferred_slot
+        if not any(left <= preferred and preferred + duration <= right for left, right in allowed):
+            raise SessionConflict('The selected time violates activity constraints or an in-flight reservation. Choose another time.')
+        if policy == 'avoid' and reviewed(details, *preferred_slot):
+            raise SessionConflict('The selected time has conflicts. Use ask to review that exact time, or choose another time.')
+        return preferred_slot
     free = subtract_periods(allowed, [(item['start'], item['end']) for item in details])
     slot = first_fit(free)
-    if slot is None and policy == 'ask':
-        slot = first_fit(allowed)
     if slot is None:
-        raise SessionConflict('No suitable slot fits. Widen the range or adjust availability; protected grey periods cannot be overridden.')
+        raise SessionConflict('No suitable free slot fits. Widen the range or explicitly select a time to review conflicts.')
     return slot
 
 
@@ -85,12 +88,16 @@ def consent(record, allow_overlap=False, token=''):
     from .sessions import SessionConflict
 
     if record.conflicts:
+        if record.time_selection != 'manual':
+            raise SessionConflict('Only a user-selected time can override personal conflicts. Request a new proposal with preferred_start.')
         if not allow_overlap or token != record.conflict_token:
             raise SessionConflict('This time is occupied. Choose another slot or explicitly approve overlap using the proposal conflict_token.')
         record.overlap_approved = True
 
 
 def record_consent(session, source_id):
+    session.grey_exceptions = [{'starts_at': session.starts_at.astimezone(utc_timezone.utc).isoformat(), 'ends_at': session.ends_at.astimezone(utc_timezone.utc).isoformat(), 'conflict': item}
+        for item in session.conflicts if item.get('kind') == 'grey_period' and session.overlap_approved]
     if session.conflicts and session.overlap_approved and not any(item['source_id'] == str(source_id) for item in session.overlap_history):
         session.overlap_history = [*session.overlap_history, {'source_id': str(source_id),
             'approved_at': timezone.now().isoformat(), 'conflict_token': session.conflict_token,
@@ -105,3 +112,9 @@ def check_review(record, current):
     if current and (not record.overlap_approved or not record.conflicts or
                     fingerprint(current, record.starts_at, record.ends_at) != record.conflict_token):
         raise SessionConflict('Calendar occupancy changed or overlap was not approved. Review a new proposal before publishing.')
+
+
+def has_grey_exception(session, item):
+    return any(saved.get('starts_at') == session.starts_at.astimezone(utc_timezone.utc).isoformat()
+               and saved.get('ends_at') == session.ends_at.astimezone(utc_timezone.utc).isoformat()
+               and saved.get('conflict') == item for saved in session.grey_exceptions)

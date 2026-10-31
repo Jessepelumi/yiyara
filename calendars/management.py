@@ -131,7 +131,7 @@ def destination_busy(user, session, start, end):
     raise services.CalendarError('Too many destination events to safely check availability.')
 
 
-def availability(user, session, start, end, exclude_change=None):
+def availability(user, session, start, end, exclude_change=None, *, manual=False):
     connection = services.get_connection(user)
     if not connection.source_calendars:
         raise ValidationError('Select availability calendars before rescheduling.')
@@ -139,12 +139,15 @@ def availability(user, session, start, end, exclude_change=None):
     busy = sessions.busy_details(user, start, end, others) + [
         {'calendar_id': session.destination_calendar, 'start': left, 'end': right}
         for left, right in destination_busy(user, session, start, end)]
-    allowed, local_busy = conflicts.local_availability(user, start, end, exclude_sessions=[session.pk], exclude_change=exclude_change)
+    allowed, local_busy = conflicts.local_availability(user, start, end, exclude_sessions=[session.pk], exclude_change=exclude_change, manual=manual)
     from goals.scheduling import apply_windows
     task = Task.objects.select_related('goal__plan').get(pk=session.task_id)
     profile = SchedulingPreferences.objects.get(user=user)
     allowed = apply_windows(task.goal.plan, profile, start, end, allowed)
-    return allowed, [*busy, *local_busy]
+    from tasks.availability import apply_task_windows
+    allowed = apply_task_windows(task, profile, start, end, allowed)
+    from .scheduling import grey_details
+    return allowed, [*busy, *local_busy, *grey_details(user, start, end)]
 
 
 def check_slot(user, session, change):
@@ -158,9 +161,9 @@ def check_slot(user, session, change):
     due = sessions.deadline(task, preferences)
     if due and change.ends_at > due:
         raise Conflict('The new session would exceed the task deadline.')
-    allowed, details = availability(user, session, change.starts_at, change.ends_at, change.pk)
+    allowed, details = availability(user, session, change.starts_at, change.ends_at, change.pk, manual=change.time_selection == 'manual')
     if not any(left <= change.starts_at and right >= change.ends_at for left, right in allowed):
-        raise Conflict('This time is protected or reserved by an in-flight operation; it cannot be overridden.')
+        raise Conflict('The selected time violates activity/ambition constraints or an in-flight reservation. Request a new proposal.')
     conflicts.check_review(change, conflicts.reviewed(details, change.starts_at, change.ends_at))
 
 
@@ -228,7 +231,7 @@ def propose(user, session_id, kind, data):
             preferred = data.get('preferred_start')
             if preferred is not None and preferred + duration > limit:
                 raise ValidationError('The preferred session must fit within the search range and deadline.')
-            choices, details = availability(user, session, data['time_min'], limit, old.pk if old else None)
+            choices, details = availability(user, session, data['time_min'], limit, old.pk if old else None, manual=preferred is not None)
             left, right = conflicts.select_slot(choices, details, duration, preferred=preferred, policy=data.get('conflict_policy', 'ask'))
             occupied = conflicts.reviewed(details, left, right)
             if (left, right) == (session.starts_at, session.ends_at):
@@ -240,7 +243,7 @@ def propose(user, session_id, kind, data):
         expiry = min(timezone.now() + timedelta(seconds=settings.PROPOSAL_TTL_SECONDS), left) if left else timezone.now() + timedelta(seconds=settings.PROPOSAL_TTL_SECONDS)
         change = SessionChange.objects.create(session=session, user=user, client_id=data['client_id'], kind=kind,
             base_version=version, request_data=canonical, before_event={'missing': True} if gone else event_summary(event),
-            task_snapshot=saved, starts_at=left, ends_at=right, expires_at=expiry, conflicts=occupied,
+            task_snapshot=saved, starts_at=left, ends_at=right, expires_at=expiry, time_selection='manual' if kind == 'reschedule' and data.get('preferred_start') is not None else 'automatic', conflicts=occupied,
             conflict_token=conflicts.fingerprint(occupied, left, right))
         return change, False
 
@@ -259,6 +262,7 @@ def finalize(session, change, event=None):
     else:
         session.starts_at, session.ends_at = change.starts_at, change.ends_at
         session.conflicts, session.conflict_token, session.overlap_approved = change.conflicts, change.conflict_token, change.overlap_approved
+        session.time_selection = change.time_selection
         conflicts.record_consent(session, change.pk)
         session.event_payload = {**session.event_payload, 'start': copy.deepcopy(event['start']),
             'end': copy.deepcopy(event['end']), 'extendedProperties': copy.deepcopy(event['extendedProperties'])}
@@ -270,7 +274,7 @@ def finalize(session, change, event=None):
     session.management_version += 1
     session.last_error = ''
     session.save(update_fields=['status', 'cancelled_at', 'starts_at', 'ends_at', 'event_payload', 'management_version', 'last_error',
-                                'conflicts', 'conflict_token', 'overlap_approved', 'overlap_history',
+                                'time_selection', 'grey_exceptions', 'conflicts', 'conflict_token', 'overlap_approved', 'overlap_history',
                                 'synced_at', 'sync_status', 'sync_error', 'sync_issues', 'remote_snapshot', 'remote_etag'])
     change.status = 'applied'
     change.applied_at = timezone.now()
