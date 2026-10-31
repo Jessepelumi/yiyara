@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 
 from rest_framework import serializers
-from calendars.serializers import SchedulingPreferencesSerializer, WorkingHoursSerializer
+from calendars.serializers import validate_weekly_windows, WorkingHoursSerializer
 
 
 class SchedulingRulesSerializer(serializers.Serializer):
@@ -24,9 +24,11 @@ class SchedulingRulesSerializer(serializers.Serializer):
     def validate_working_hours(self, value):
         if value is None:
             return None
-        return SchedulingPreferencesSerializer().validate_working_hours(value)
+        return validate_weekly_windows(value)
 
     def validate(self, data):
+        for key in ('not_before', 'deadline', 'working_hours'):
+            data.setdefault(key, None)
         if data['not_before'] and data['deadline'] and data['deadline'] <= data['not_before']:
             raise serializers.ValidationError('deadline must follow not_before.')
         return {key: value.isoformat() if isinstance(value, datetime) else value for key, value in data.items()}
@@ -45,10 +47,14 @@ def needs_review(plan):
 
 
 def apply_windows(plan, profile, start, end, windows):
-    """Intersect confirmed rules with global allowed windows; never expand them."""
+    """Intersect confirmed ambition rules with time outside grey periods."""
     if needs_review(plan):
         raise serializers.ValidationError('Confirm scheduling_rules for the saved timing and constraints before scheduling.')
-    rules = plan.context.get('scheduling_rules') or {}
+    return apply_time_rules(plan.context.get('scheduling_rules') or {}, profile, start, end, windows)
+
+
+def apply_time_rules(rules, profile, start, end, windows):
+    """Narrow permissible time using explicit ambition or activity rules."""
     earliest = datetime.fromisoformat(rules['not_before']) if rules.get('not_before') else None
     deadline = datetime.fromisoformat(rules['deadline']) if rules.get('deadline') else None
     clipped = [(max(a, earliest) if earliest else a, min(b, deadline) if deadline else b) for a, b in windows]
@@ -56,6 +62,6 @@ def apply_windows(plan, profile, start, end, windows):
     hours = rules.get('working_hours')
     if hours is not None:
         from calendars.scheduling import permitted_windows
-        extra = permitted_windows(profile.user, start, end, working_hours=hours)
+        extra = permitted_windows(profile.user, start, end, working_hours=hours, ignore_grey=True)
         clipped = [(max(a, c), min(b, d)) for a, b in clipped for c, d in extra if max(a, c) < min(b, d)]
     return clipped

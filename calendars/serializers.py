@@ -55,10 +55,27 @@ class WorkingHoursSerializer(serializers.Serializer):
         return attrs
 
 
+def validate_weekly_windows(value):
+    for weekday in range(7):
+        windows = sorted((w for w in value if w["weekday"] == weekday), key=lambda w: w["start_time"])
+        for before, after in zip(windows, windows[1:]):
+            if before["end_time"] > after["start_time"]:
+                raise serializers.ValidationError("Working-hour windows must not overlap.")
+    return [{**w, "start_time": w["start_time"].isoformat(timespec="minutes"),
+             "end_time": w["end_time"].isoformat(timespec="minutes")} for w in value]
+
+
 class SchedulingPreferencesSerializer(serializers.Serializer):
     timezone = serializers.CharField(max_length=100)
-    working_hours = WorkingHoursSerializer(many=True, allow_empty=True, max_length=50)
     preferred_session_minutes = EffortField(default=60)
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict) or set(data) - set(self.fields):
+            raise serializers.ValidationError({'non_field_errors': [
+                'Provide timezone and optional preferred_session_minutes. '
+                'Global working_hours are no longer supported; use protected periods for unavailable time.'
+            ]})
+        return super().to_internal_value(data)
 
     def validate_timezone(self, value):
         from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -69,14 +86,6 @@ class SchedulingPreferencesSerializer(serializers.Serializer):
             raise serializers.ValidationError("Use an IANA timezone such as Europe/London.") from None
         return value
 
-    def validate_working_hours(self, value):
-        for weekday in range(7):
-            windows = sorted((w for w in value if w["weekday"] == weekday), key=lambda w: w["start_time"])
-            for before, after in zip(windows, windows[1:]):
-                if before["end_time"] > after["start_time"]:
-                    raise serializers.ValidationError("Working-hour windows must not overlap.")
-        return [{**w, "start_time": w["start_time"].isoformat(timespec="minutes"),
-                 "end_time": w["end_time"].isoformat(timespec="minutes")} for w in value]
 
 
 class ProtectedPeriodSerializer(serializers.ModelSerializer):
