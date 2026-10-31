@@ -1,6 +1,26 @@
 TASK_PLANNING_SYSTEM_PROMPT = """
 You are Yiyara, proposing the next executable work for one person's clarified ambition.
 Use confirmed context, existing goals/tasks, saved answers and scheduling preferences.
+Personal availability is ALL time outside protected grey periods, not a global
+working-hours timetable. Never assume waking, sleep or office hours. Activity-specific
+availability is independent: school opening hours and confirmed instructor lesson
+slots are not necessarily the same. Never schedule a service outside confirmed
+applicable hours; ask for missing availability or propose an action to obtain it.
+
+Every task should include availability: status=unrestricted for self-directed work;
+status=unknown with a reason for service-dependent work without confirmed slots;
+or status=confirmed with rules (not_before/deadline/working_hours) and evidence.
+Evidence is a list of source_message_id and exact quote from a USER message in this
+plan (IDs are available in context provenance and answered questions). It records
+what the user reports, not independently verified provider facts. Unknown activity
+availability must be blocked/draft, never ready. Confirmed windows must describe
+actual relevant service/instructor availability, not guess it from user free time.
+Restrict only the relevant task: lesson hours must not constrain paperwork, research
+or other self-directed actions. Ambition-wide rules apply only to genuinely shared
+restrictions. Ready tasks can use unrestricted availability when no external timing
+is required. Do not fabricate a business-hours default.
+Completion must describe work the user controls: sending an enquiry, not receiving
+a reply within the session. Retain external waiting as a blocker.
 Use reported task outcomes and remaining effort when choosing subsequent work. Completed
 work stays complete; partial work is not a new duplicate task. Skipped work is not complete,
 and a blocked task requires actual missing information before it can proceed. Outcome notes
@@ -61,7 +81,7 @@ TASK_PLANNING_SCHEMA = {
                 "title": {"type": "string"}, "description": {"type": "string"},
                 "tasks": {"type": "array", "items": {
                     "type": "object", "required": ["key", "title", "description", "completion_criteria",
-                                                       "estimated_minutes", "readiness", "blocker_reason", "depends_on"],
+                                                       "estimated_minutes", "readiness", "blocker_reason", "depends_on", "availability"],
                     "properties": {
                         "key": {"type": "string"}, "title": {"type": "string"},
                         "description": {"type": "string"}, "completion_criteria": {"type": "string"},
@@ -69,6 +89,19 @@ TASK_PLANNING_SCHEMA = {
                         "readiness": {"type": "string", "enum": ["ready", "draft", "blocked"]},
                         "blocker_reason": {"type": "string"},
                         "depends_on": {"type": "array", "items": {"type": "string"}},
+                        "availability": {"type": "object", "required": ["status"], "properties": {
+                            "status": {"type": "string", "enum": ["unrestricted", "unknown", "confirmed"]},
+                            "reason": {"type": "string"},
+                            "rules": {"type": "object", "properties": {
+                                "not_before": {"type": ["string", "null"]}, "deadline": {"type": ["string", "null"]},
+                                "working_hours": {"type": ["array", "null"], "items": {"type": "object", "required": ["weekday", "start_time", "end_time"], "properties": {
+                                    "weekday": {"type": "integer"}, "start_time": {"type": "string"}, "end_time": {"type": "string"}
+                                }}}
+                            }},
+                            "evidence": {"type": "array", "items": {"type": "object", "required": ["source_message_id", "quote"], "properties": {
+                                "source_message_id": {"type": "string"}, "quote": {"type": "string"}
+                            }}}
+                        }},
                     },
                 }},
             },

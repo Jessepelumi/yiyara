@@ -82,7 +82,7 @@ def handle_clarification(plan, conversation, raw_text, *, client_id=None, gatewa
             'current_local_time': timezone.now().astimezone(zone).isoformat(),
             'timezone': str(zone), 'timezone_is_fallback': profile is None,
             'scheduling_preferences': {
-                'timezone': profile.timezone, 'working_hours': profile.working_hours,
+                'timezone': profile.timezone, 'availability_basis': 'all_time_except_protected_periods',
                 'preferred_session_minutes': profile.preferred_session_minutes,
             } if profile else None,
             'persistent_plan': snapshot,
