@@ -28,7 +28,6 @@ class CalendarAuthorization(models.Model):
 class SchedulingPreferences(models.Model):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     timezone = models.CharField(max_length=100)
-    working_hours = models.JSONField(default=list)
     preferred_session_minutes = models.PositiveIntegerField(default=60)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -98,10 +97,13 @@ class WorkSession(models.Model):
     sync_issues = models.JSONField(default=list, blank=True)
     remote_etag = models.CharField(max_length=1024, blank=True)
     remote_snapshot = models.JSONField(default=dict, blank=True)
+    time_selection = models.CharField(max_length=10, default='automatic', choices=[('automatic', 'Automatic'), ('manual', 'User-selected')])
     conflicts = models.JSONField(default=list, blank=True)
     conflict_token = models.CharField(max_length=64, blank=True)
     overlap_approved = models.BooleanField(default=False)
     overlap_history = models.JSONField(default=list, blank=True)
+    grey_exceptions = models.JSONField(default=list, blank=True)
+    completion_presentation = models.JSONField(default=dict, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -152,6 +154,7 @@ class SessionChange(models.Model):
     lease_until = models.DateTimeField(null=True)
     last_error = models.CharField(max_length=250, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    time_selection = models.CharField(max_length=10, default='automatic', choices=[('automatic', 'Automatic'), ('manual', 'User-selected')])
     conflicts = models.JSONField(default=list, blank=True)
     conflict_token = models.CharField(max_length=64, blank=True)
     overlap_approved = models.BooleanField(default=False)

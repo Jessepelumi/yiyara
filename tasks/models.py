@@ -36,6 +36,7 @@ class Task(models.Model):
         default="draft",
     )
     blocker_reason = models.TextField(blank=True)
+    availability = models.JSONField(default=dict, blank=True)
     progress_status = models.CharField(max_length=12, default='not_started', choices=[
         ('not_started', 'Not started'), ('partial', 'Partial'), ('completed', 'Completed'),
         ('blocked', 'Blocked'), ('skipped', 'Skipped'),
