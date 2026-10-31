@@ -256,7 +256,6 @@ class SchedulingRulesTests(APITestCase):
         self.client.force_authenticate(self.user)
         self.preferences = {
             "timezone": "Europe/London", "preferred_session_minutes": 60,
-            "working_hours": [{"weekday": 0, "start_time": "09:00", "end_time": "17:00"}],
         }
 
     def configure(self, **changes):
@@ -285,22 +284,22 @@ class SchedulingRulesTests(APITestCase):
     def test_preferences_roundtrip_and_replace_without_google_connection(self):
         self.configure()
         self.assertEqual(self.client.get(self.preferences_url).data["timezone"], "Europe/London")
-        self.configure(working_hours=[])
-        self.assertEqual(self.preview().data["windows"], [])
+        self.configure(timezone="UTC")
+        windows = self.preview().data["windows"]
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0]["ends_at"] - windows[0]["starts_at"], timedelta(days=1))
+        self.assertNotIn("working_hours", self.client.get(self.preferences_url).data)
 
     def test_invalid_preferences_do_not_replace_existing_rules(self):
         self.configure()
         invalid = [
             {"timezone": "Not/AZone"}, {"preferred_session_minutes": 0},
-            {"working_hours": [{"weekday": 7, "start_time": "09:00", "end_time": "17:00"}]},
-            {"working_hours": [{"weekday": 0, "start_time": "17:00", "end_time": "09:00"}]},
-            {"working_hours": [{"weekday": 0, "start_time": "09:00:01", "end_time": "17:00"}]},
-            {"working_hours": [self.preferences["working_hours"][0], {"weekday": 0, "start_time": "16:00", "end_time": "18:00"}]},
+            {"working_hours": []}, {"working_hours": [{"weekday": 0, "start_time": "09:00", "end_time": "17:00"}]},
         ]
         for changes in invalid:
             with self.subTest(changes=changes):
                 self.assertEqual(self.client.put(self.preferences_url, {**self.preferences, **changes}, format="json").status_code, 400)
-        self.assertEqual(self.client.get(self.preferences_url).data["working_hours"][0]["start_time"], "09:00")
+        self.assertEqual(self.client.get(self.preferences_url).data["timezone"], "Europe/London")
 
     def test_weekly_and_one_off_subtracted_and_clipped_exactly(self):
         self.configure()
@@ -314,11 +313,11 @@ class SchedulingRulesTests(APITestCase):
         self.assertFalse(response.data["google_busy_time_checked"])
         windows = response.data["windows"]
         self.assertEqual(len(windows), 3)
-        self.assertEqual(windows[0]["starts_at"].hour, 9)
+        self.assertEqual(windows[0]["starts_at"].hour, 0)
         self.assertEqual(windows[0]["ends_at"].hour, 12)
         self.assertEqual(windows[1]["ends_at"].second, 15)
         self.assertEqual(windows[2]["starts_at"].second, 30)
-        self.assertEqual(windows[2]["ends_at"].hour, 17)
+        self.assertEqual(windows[2]["ends_at"] - windows[0]["starts_at"], timedelta(days=1))
         clipped = self.preview("2026-11-02T09:00:30Z", "2026-11-02T10:00:15Z").data["windows"]
         self.assertEqual(clipped[0]["starts_at"].second, 30)
         self.assertEqual(clipped[0]["ends_at"].second, 15)
@@ -386,20 +385,20 @@ class SchedulingRulesTests(APITestCase):
         self.assertEqual(self.weekly().status_code, 400)
 
     def test_dst_fall_back_protects_both_repeated_hours(self):
-        self.configure(working_hours=[{"weekday": 6, "start_time": "00:00", "end_time": "04:00"}])
+        self.configure()
         self.assertEqual(self.weekly(weekdays=[6], start_time="01:00", end_time="02:00").status_code, 201)
         response = self.preview("2026-10-25T00:00:00Z", "2026-10-25T04:00:00Z")
         self.assertEqual(len(response.data["windows"]), 1)
         self.assertEqual(response.data["windows"][0]["starts_at"].hour, 2)
 
     def test_dst_spring_forward_and_timezone_change(self):
-        self.configure(working_hours=[{"weekday": 6, "start_time": "00:00", "end_time": "04:00"}])
+        self.configure()
         windows = self.preview("2027-03-28T00:00:00Z", "2027-03-28T04:00:00Z").data["windows"]
         self.assertEqual(len(windows), 1)
-        self.assertEqual(windows[0]["ends_at"].hour, 3)
+        self.assertEqual(windows[0]["ends_at"].hour, 4)
         self.configure(timezone="America/New_York")
         windows = self.preview().data["windows"]
-        self.assertEqual(windows[0]["starts_at"].hour, 14)
+        self.assertEqual(windows[0]["starts_at"].hour, 0)
 
     def test_no_google_requests_for_local_rules(self):
         self.configure()
@@ -424,9 +423,7 @@ class TaskSessionTests(APITestCase):
                                         estimated_minutes=60, completion_criteria='Two solutions reviewed', readiness='ready')
         self.start = (timezone.now() + timedelta(days=10)).replace(hour=9, minute=0, second=0, microsecond=0)
         self.end = self.start + timedelta(hours=8)
-        SchedulingPreferences.objects.create(user=self.user, timezone='UTC', working_hours=[
-            {'weekday': day, 'start_time': '09:00', 'end_time': '17:00'} for day in range(7)
-        ])
+        SchedulingPreferences.objects.create(user=self.user, timezone='UTC')
         CalendarConnection.objects.create(
             user=self.user, google_sub='subject', email=self.user.email, credentials='not-used',
             expires_at=timezone.now() + timedelta(hours=1), source_calendars=['source'], destination_calendar='target',
@@ -841,8 +838,7 @@ class SessionManagementTests(APITestCase):
         self.task = Task.objects.create(goal=self.goal, title='Write traversal', description='Write a loop.',
             estimated_minutes=60, completion_criteria='Print five values.', readiness='ready')
         self.start = (timezone.now() + timedelta(days=10)).replace(hour=9, minute=0, second=0, microsecond=0)
-        SchedulingPreferences.objects.create(user=self.user, timezone='UTC', working_hours=[
-            {'weekday': day, 'start_time': '09:00', 'end_time': '17:00'} for day in range(7)])
+        SchedulingPreferences.objects.create(user=self.user, timezone='UTC')
         CalendarConnection.objects.create(user=self.user, google_sub='subject', email=self.user.email,
             credentials='unused', expires_at=timezone.now() + timedelta(hours=1), source_calendars=['target', 'source'], destination_calendar='target')
         session_id = uuid.uuid4()
@@ -1088,7 +1084,10 @@ class SessionManagementTests(APITestCase):
         self.assertEqual(replay.status_code, 200, replay.data)
         self.assertEqual(replay.data['change']['id'], response.data['change']['id'])
         self.assertEqual(self.cancel(client_id=client_id).status_code, 409)
-        # An impossible replacement must not discard the useful old proposal.
+        # An explicitly protected replacement must not discard the useful old proposal.
+        from .models import ProtectedPeriod
+        ProtectedPeriod.objects.create(user=self.user, kind='one_off',
+            starts_at=self.start.replace(hour=18), ends_at=self.start.replace(hour=19))
         impossible = self.move(time_min=self.start.replace(hour=18).isoformat(), time_max=self.start.replace(hour=19).isoformat())
         self.assertEqual(impossible.status_code, 409)
         self.assertEqual(SessionChange.objects.get(pk=response.data['change']['id']).status, 'proposed')
@@ -1141,7 +1140,8 @@ class SessionManagementTests(APITestCase):
     def test_all_day_events_and_transparent_events_in_destination(self):
         self.events = [{'id': 'all-day', 'start': {'date': self.start.date().isoformat()},
                         'end': {'date': (self.start + timedelta(days=1)).date().isoformat()}}]
-        occupied = self.move()
+        self.assertEqual(self.move().status_code, 409)
+        occupied = self.move(preferred_start=(self.start + timedelta(hours=2)).isoformat())
         self.assertEqual(occupied.status_code, 201, occupied.data)
         self.assertTrue(occupied.data['change']['requires_conflict_approval'])
         self.events[0]['transparency'] = 'transparent'
@@ -1323,8 +1323,7 @@ class OverlapSchedulingTests(APITestCase):
                                         completion_criteria='Two solutions written.')
         self.start = (timezone.now() + timedelta(days=10)).replace(hour=9, minute=0, second=0, microsecond=0)
         self.end = self.start + timedelta(hours=4)
-        SchedulingPreferences.objects.create(user=self.user, timezone='UTC', working_hours=[
-            {'weekday': day, 'start_time': '09:00', 'end_time': '17:00'} for day in range(7)])
+        SchedulingPreferences.objects.create(user=self.user, timezone='UTC')
         CalendarConnection.objects.create(user=self.user, google_sub='subject', email=self.user.email, credentials='unused',
             expires_at=self.end, source_calendars=['source'], destination_calendar='target')
         self.busy = {'source': [], 'target': []}
@@ -1365,7 +1364,8 @@ class OverlapSchedulingTests(APITestCase):
 
     def test_busy_only_range_returns_review_then_explicit_overlap_preserves_other_events(self):
         self.occupy()
-        response = self.propose()
+        self.assertEqual(self.propose().status_code, 409)
+        response = self.propose(preferred_start=self.start.isoformat())
         self.assertEqual(response.status_code, 201, response.data)
         self.assertTrue(response.data['requires_conflict_approval'])
         self.assertEqual(response.data['conflicts'][0]['calendar_id'], 'source')
@@ -1397,7 +1397,7 @@ class OverlapSchedulingTests(APITestCase):
         from .models import WorkSession
 
         self.occupy()
-        occupied = self.propose()
+        occupied = self.propose(preferred_start=self.start.isoformat())
         alternative = self.propose(conflict_policy='avoid')
         self.assertEqual(alternative.status_code, 409)
         self.assertEqual(WorkSession.objects.get(pk=occupied.data['id']).status, 'proposed')
@@ -1407,15 +1407,16 @@ class OverlapSchedulingTests(APITestCase):
         self.assertFalse(alternative.data['requires_conflict_approval'])
         self.assertEqual(WorkSession.objects.get(pk=occupied.data['id']).status, 'rejected')
 
-    def test_grey_period_cannot_be_overridden_at_proposal_or_approval(self):
+    def test_manual_grey_override_requires_fresh_review_after_new_protection(self):
         from .models import ProtectedPeriod
 
         ProtectedPeriod.objects.create(user=self.user, kind='one_off', starts_at=self.start, ends_at=self.start + timedelta(hours=1))
         self.occupy()
         response = self.propose(preferred_start=self.start.isoformat())
-        self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data['starts_at'], (self.start + timedelta(hours=1)).isoformat().replace('+00:00', 'Z'))
-        ProtectedPeriod.objects.create(user=self.user, kind='one_off', starts_at=self.start + timedelta(hours=1), ends_at=self.end)
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data['starts_at'], self.start.isoformat().replace('+00:00', 'Z'))
+        self.assertTrue(any(item.get('kind') == 'grey_period' for item in response.data['conflicts']))
+        ProtectedPeriod.objects.create(user=self.user, kind='one_off', starts_at=self.start, ends_at=self.start + timedelta(minutes=30))
         result = self.approve(response, allow_overlap=True, conflict_token=response.data['conflict_token'])
         self.assertEqual(result.status_code, 409, result.data)
         self.assertFalse(self.writes)
@@ -1423,12 +1424,12 @@ class OverlapSchedulingTests(APITestCase):
 
     def test_changed_or_new_conflict_requires_fresh_review(self):
         self.occupy()
-        response = self.propose()
+        response = self.propose(preferred_start=self.start.isoformat())
         self.occupy(calendar='target')
         result = self.approve(response, allow_overlap=True, conflict_token=response.data['conflict_token'])
         self.assertEqual(result.status_code, 409)
         self.assertFalse(self.writes)
-        replacement = self.propose()
+        replacement = self.propose(preferred_start=self.start.isoformat())
         self.assertNotEqual(replacement.data['conflict_token'], response.data['conflict_token'])
         self.assertEqual(self.approve(replacement, allow_overlap=True, conflict_token=replacement.data['conflict_token']).status_code, 200)
 
@@ -1442,7 +1443,7 @@ class OverlapSchedulingTests(APITestCase):
         from . import sessions
 
         self.occupy()
-        response = self.propose()
+        response = self.propose(preferred_start=self.start.isoformat())
         actual = sessions.event_request
         def change_busy(user, session, method, payload=None):
             self.occupy(calendar='target')
@@ -1460,7 +1461,7 @@ class OverlapSchedulingTests(APITestCase):
         from . import sessions
 
         self.occupy()
-        response = self.propose()
+        response = self.propose(preferred_start=self.start.isoformat())
         actual = sessions.event_request
         def timeout(user, session, method, payload=None):
             result = actual(user, session, method, payload)
@@ -1481,20 +1482,20 @@ class OverlapSchedulingTests(APITestCase):
         other = Task.objects.create(goal=self.goal, title='Existing task')
         session = WorkSession.objects.create(user=self.user, task=other, status='published', starts_at=self.start, ends_at=self.end,
             expires_at=self.end, google_sub='subject', google_event_id=uuid.uuid4().hex, destination_calendar='old-calendar')
-        response = self.propose()
+        response = self.propose(preferred_start=self.start.isoformat())
         self.assertEqual(response.status_code, 201)
         self.assertTrue(response.data['requires_conflict_approval'])
         self.assertEqual(response.data['conflicts'][0]['calendar_id'], 'old-calendar')
         session.status = 'publishing'
         session.save()
-        self.assertEqual(self.propose().status_code, 409)
+        self.assertEqual(self.propose(preferred_start=self.start.isoformat()).status_code, 409)
         self.assertFalse(self.writes)
 
     def test_conflict_data_is_merged_and_clipped_to_the_reviewed_slot(self):
         self.busy['source'] = [
             {'start': self.start.isoformat(), 'end': (self.start + timedelta(minutes=45)).isoformat()},
             {'start': (self.start + timedelta(minutes=30)).isoformat(), 'end': self.end.isoformat()}]
-        response = self.propose()
+        response = self.propose(preferred_start=self.start.isoformat())
         self.assertEqual(response.status_code, 201)
         self.assertEqual(len(response.data['conflicts']), 1)
         self.assertEqual(response.data['conflicts'][0]['end'], (self.start + timedelta(hours=1)).isoformat())
@@ -2225,7 +2226,6 @@ class AmbitionRuleTimezoneTests(APITestCase):
         from goals.scheduling import apply_windows, basis
         profile = SchedulingPreferences.objects.get(user=self.user)
         profile.timezone = 'Europe/London'
-        profile.working_hours = [{'weekday': 6, 'start_time': '00:00', 'end_time': '03:00'}]
         profile.save()
         self.plan.context = {'scheduling_rules': {'working_hours': [{'weekday': 6, 'start_time': '01:00', 'end_time': '01:30'}]}}
         self.plan.context['scheduling_rules_basis'] = basis(self.plan.context)
@@ -2246,3 +2246,440 @@ class AmbitionRuleTimezoneTests(APITestCase):
         self.assertEqual(self.propose().status_code, 400)
         self.context(scheduling_rules={})
         self.assertEqual(self.propose().status_code, 201)
+
+
+class GreyAreaAvailabilityTests(APITestCase):
+    setUp = TaskSessionTests.setUp
+    freebusy = TaskSessionTests.freebusy
+    propose = TaskSessionTests.propose
+    approve = TaskSessionTests.approve
+
+    def test_unprotected_time_including_overnight_has_no_global_hours_gate(self):
+        from .models import WorkSession
+        for hour in [0, 3, 20, 23]:
+            with self.subTest(hour=hour):
+                self.start = self.start.replace(hour=hour)
+                self.end = self.start + timedelta(hours=1)
+                result = self.propose()
+                self.assertEqual(result.status_code, 201, result.data)
+                self.assertEqual(result.data['starts_at'], self.start.isoformat().replace('+00:00', 'Z'))
+                WorkSession.objects.filter(pk=result.data['id']).update(status='rejected')
+
+    def test_each_user_controls_their_own_grey_periods(self):
+        from .models import ProtectedPeriod, SchedulingPreferences
+        from .scheduling import permitted_windows
+        self.start = self.start.replace(hour=0)
+        self.end = self.start + timedelta(hours=5)
+        ProtectedPeriod.objects.create(user=self.user, kind='weekly', weekdays=list(range(7)),
+            start_time='00:00', end_time='05:00')
+        other = get_user_model().objects.create_user(email='night-worker@example.com')
+        SchedulingPreferences.objects.create(user=other, timezone='UTC')
+        self.assertEqual(permitted_windows(self.user, self.start, self.end), [])
+        self.assertEqual(permitted_windows(other, self.start, self.end), [(self.start, self.end)])
+        self.assertEqual(self.propose().status_code, 409)
+
+    def test_google_busy_time_and_grey_periods_are_not_implicitly_free(self):
+        from .models import ProtectedPeriod
+        self.start = self.start.replace(hour=0)
+        self.end = self.start + timedelta(hours=2)
+        ProtectedPeriod.objects.create(user=self.user, kind='one_off', starts_at=self.start,
+                                       ends_at=self.start + timedelta(hours=1))
+        def occupied(user, method, path, **kwargs):
+            return {'calendars': {item['id']: {'busy': [{'start': (self.start + timedelta(hours=1)).isoformat(),
+                    'end': self.end.isoformat()}]} for item in kwargs['json']['items']}}
+        with patch('calendars.services.api', side_effect=occupied):
+            response = self.client.post(f'/api/tasks/{self.task.pk}/sessions/propose/', {
+                'time_min': self.start.isoformat(), 'time_max': self.end.isoformat(), 'conflict_policy': 'avoid'}, format='json')
+        self.assertEqual(response.status_code, 409)
+
+    def activity(self, **changes):
+        from conversations.models import Conversation, Message
+        conversation, _ = Conversation.objects.get_or_create(plan=self.plan, defaults={'user': self.user})
+        source = Message.objects.create(conversation=conversation, role='user',
+            content='My instructor confirmed lessons daily between 15:00 and 17:00.')
+        return {'status': 'confirmed', 'rules': {'working_hours': [
+            {'weekday': day, 'start_time': '15:00', 'end_time': '17:00'} for day in range(7)]},
+            'evidence': [{'source_message_id': str(source.pk), 'quote': source.content}], **changes}
+
+    def test_confirmed_activity_hours_apply_only_to_the_relevant_task(self):
+        from tasks.models import Task
+        response = self.client.patch(f'/api/tasks/{self.task.pk}/', {'availability': self.activity()}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        result = self.propose()
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(result.data['starts_at'][11:13], '15')
+        admin = Task.objects.create(goal=self.goal, title='Research instructors', estimated_minutes=30,
+            readiness='ready', completion_criteria='A shortlist saved')
+        result = self.propose(admin)
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(result.data['starts_at'][11:13], '09')
+
+    def test_unknown_activity_availability_blocks_scheduling_and_ready_override(self):
+        response = self.client.patch(f'/api/tasks/{self.task.pk}/', {
+            'readiness': 'blocked', 'blocker_reason': 'Awaiting instructor slots',
+            'availability': {'status': 'unknown', 'reason': 'Instructor has not confirmed lesson times.'}}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertFalse(response.data['is_schedulable'])
+        self.assertEqual(self.propose().status_code, 400)
+        response = self.client.patch(f'/api/tasks/{self.task.pk}/', {'readiness': 'ready', 'blocker_reason': ''}, format='json')
+        self.assertEqual(response.status_code, 400)
+
+    def test_confirmed_activity_requires_real_evidence_not_model_invention(self):
+        availability = self.activity()
+        for evidence in [[], [{'source_message_id': availability['evidence'][0]['source_message_id'], 'quote': 'Invented opening hours.'}]]:
+            with self.subTest(evidence=evidence):
+                response = self.client.patch(f'/api/tasks/{self.task.pk}/', {'availability': {**availability, 'evidence': evidence}}, format='json')
+                self.assertEqual(response.status_code, 400, response.data)
+        import uuid
+        response = self.client.patch(f'/api/tasks/{self.task.pk}/', {'availability': {
+            **availability, 'evidence': [{'source_message_id': str(uuid.uuid4()), 'quote': 'Fake source'}]}}, format='json')
+        self.assertEqual(response.status_code, 400)
+
+    def test_activity_constraints_do_not_override_grey_periods(self):
+        from .models import ProtectedPeriod
+        self.client.patch(f'/api/tasks/{self.task.pk}/', {'availability': self.activity()}, format='json')
+        ProtectedPeriod.objects.create(user=self.user, kind='one_off',
+            starts_at=self.start.replace(hour=15), ends_at=self.start.replace(hour=17))
+        self.assertEqual(self.propose().status_code, 409)
+
+    def test_activity_change_invalidates_old_session_and_new_rules_are_enforced(self):
+        from .models import WorkSession
+        result = self.propose()
+        session = WorkSession.objects.get(pk=result.data['id'])
+        self.client.patch(f'/api/tasks/{self.task.pk}/', {'availability': self.activity()}, format='json')
+        with patch('calendars.sessions.event_request') as google:
+            self.assertEqual(self.approve(session).status_code, 409)
+        google.assert_not_called()
+
+    def test_revision_restore_preserves_activity_rules(self):
+        from goals.services import restore_plan_revision
+        saved = self.client.patch(f'/api/tasks/{self.task.pk}/', {'availability': self.activity()}, format='json')
+        self.assertEqual(saved.status_code, 200, saved.data)
+        self.plan.refresh_from_db()
+        revision = self.plan.revisions.get(version=self.plan.version)
+        self.client.patch(f'/api/tasks/{self.task.pk}/', {'availability': {'status': 'unrestricted'}}, format='json')
+        restore_plan_revision(revision, self.user)
+        self.task.refresh_from_db()
+        self.assertEqual(self.task.availability['status'], 'confirmed')
+        self.assertEqual(self.propose().data['starts_at'][11:13], '15')
+
+
+class GreyAreaManagementTests(APITestCase):
+    setUp = SessionManagementTests.setUp
+    calendar_api = SessionManagementTests.calendar_api
+    provider = SessionManagementTests.provider
+    move = SessionManagementTests.move
+    approve_change = SessionManagementTests.approve_change
+
+    def test_reschedule_outside_former_office_hours_is_allowed(self):
+        left = self.start.replace(hour=22)
+        result = self.move(time_min=left.isoformat(), time_max=(left+timedelta(hours=1)).isoformat())
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(result.data['change']['starts_at'], left.isoformat().replace('+00:00', 'Z'))
+        self.assertEqual(self.approve_change(result).status_code, 200)
+
+    def test_management_and_external_refresh_enforce_activity_hours(self):
+        from conversations.models import Conversation, Message
+        from .sessions import snapshot
+        conversation = Conversation.objects.create(plan=self.plan, user=self.user)
+        source = Message.objects.create(conversation=conversation, role='user', content='Lessons are confirmed daily from 09:00 to 10:00 and 18:00 to 20:00.')
+        self.task.availability = {'status': 'confirmed', 'rules': {'working_hours': [
+            {'weekday': day, 'start_time': left, 'end_time': right} for day in range(7)
+            for left,right in [('09:00','10:00'),('18:00','20:00')]]},
+            'evidence': [{'source_message_id': str(source.pk), 'quote': source.content}]}
+        self.task.save()
+        self.session.task_snapshot = snapshot(self.task)
+        self.session.save()
+        result = self.move(time_min=self.start.replace(hour=17).isoformat(), time_max=self.start.replace(hour=20).isoformat())
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(result.data['change']['starts_at'][11:13], '18')
+        self.assertEqual(self.approve_change(result).status_code, 200)
+        self.event['start'] = {'dateTime': self.start.replace(hour=14).isoformat()}
+        self.event['end'] = {'dateTime': self.start.replace(hour=15).isoformat()}
+        self.event['etag'] = '"externally-outside-lesson-hours"'
+        response = self.client.post(f'/api/sessions/{self.session.pk}/refresh/')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['sync_status'], 'review')
+        self.assertTrue(any('outside_activity_availability' in issue for issue in response.data['sync_issues']))
+
+
+class ManualGreyExceptionTests(APITestCase):
+    setUp = OverlapSchedulingTests.setUp
+    freebusy = OverlapSchedulingTests.freebusy
+    provider = OverlapSchedulingTests.provider
+    occupy = OverlapSchedulingTests.occupy
+    propose = OverlapSchedulingTests.propose
+    approve = OverlapSchedulingTests.approve
+
+    def protect(self, **changes):
+        from .models import ProtectedPeriod
+        return ProtectedPeriod.objects.create(user=self.user, kind='one_off',
+            starts_at=self.start, ends_at=self.start + timedelta(hours=1), **changes)
+
+    def published(self):
+        from .models import WorkSession
+        result = self.propose()
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(self.approve(result).status_code, 200)
+        session = WorkSession.objects.get(pk=result.data['id'])
+        self.events[session.google_event_id]['etag'] = '"review-event"'
+        return session
+
+    def period_body(self, **changes):
+        return {'kind': 'one_off', 'title': 'New job', 'starts_at': self.start.isoformat(),
+                'ends_at': (self.start + timedelta(hours=1)).isoformat(), **changes}
+
+    def test_only_manual_exact_time_can_override_grey_with_review(self):
+        from .models import WorkSession
+        self.protect()
+        self.end = self.start + timedelta(hours=1)
+        self.assertEqual(self.propose().status_code, 409)
+        result = self.propose(preferred_start=self.start.isoformat())
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(result.data['time_selection'], 'manual')
+        self.assertEqual(result.data['conflicts'][0]['kind'], 'grey_period')
+        self.assertFalse(self.writes)
+        self.assertEqual(self.approve(result).status_code, 409)
+        self.assertEqual(self.approve(result, allow_overlap=True, conflict_token=result.data['conflict_token']).status_code, 200)
+        session = WorkSession.objects.get(pk=result.data['id'])
+        self.assertEqual(len(session.grey_exceptions), 1)
+        self.assertEqual(self.approve(result).status_code, 200)
+        self.assertEqual(len(self.writes), 1)
+        self.events[session.google_event_id]['etag'] = '"grey-approved"'
+        refreshed = self.client.post(f'/api/sessions/{session.pk}/refresh/')
+        self.assertEqual(refreshed.status_code, 200, refreshed.data)
+        self.assertFalse(any(issue.startswith('outside_availability:') for issue in refreshed.data['sync_issues']))
+        # Keep consent stable when Google represents the same instant with another offset.
+        from .conflicts import has_grey_exception
+        from datetime import timezone as tz
+        session.starts_at = session.starts_at.astimezone(tz(timedelta(hours=1)))
+        session.ends_at = session.ends_at.astimezone(tz(timedelta(hours=1)))
+        self.assertTrue(has_grey_exception(session, session.grey_exceptions[0]['conflict']))
+
+    def test_another_task_cannot_inherit_the_exception(self):
+        from tasks.models import Task
+        self.protect()
+        self.end = self.start + timedelta(hours=1)
+        result = self.propose(preferred_start=self.start.isoformat())
+        self.assertEqual(self.approve(result, allow_overlap=True, conflict_token=result.data['conflict_token']).status_code, 200)
+        self.task = Task.objects.create(goal=self.goal, title='Parallel task', readiness='ready', estimated_minutes=30,
+                                        completion_criteria='Independent result saved')
+        self.assertEqual(self.propose().status_code, 409)
+        manual = self.propose(preferred_start=self.start.isoformat())
+        self.assertEqual(manual.status_code, 201, manual.data)
+        self.assertTrue(manual.data['requires_conflict_approval'])
+
+    def test_manual_selection_does_not_bypass_activity_hours_or_inflight_reservations(self):
+        from .models import WorkSession
+        import uuid
+        response = self.client.patch(f'/api/plans/{self.plan.pk}/context/', {
+            'plan_version': self.plan.version, 'scheduling_rules': {'not_before': self.start.replace(hour=15).isoformat()}}, format='json')
+        # This fixture is a legacy plan; verify the independent in-flight guard here.
+        WorkSession.objects.create(user=self.user, task=self.task, starts_at=self.start, ends_at=self.end,
+            expires_at=self.end, google_sub='subject', destination_calendar='target', google_event_id=uuid.uuid4().hex,
+            status='publishing')
+        self.assertEqual(self.propose(preferred_start=self.start.isoformat()).status_code, 409)
+
+    def test_period_edit_invalidates_review_even_for_same_overlap(self):
+        period = self.protect()
+        result = self.propose(preferred_start=self.start.isoformat())
+        period.title = 'Changed personal restriction'
+        period.save()
+        self.assertEqual(self.approve(result, allow_overlap=True, conflict_token=result.data['conflict_token']).status_code, 409)
+        self.assertFalse(self.writes)
+
+    def test_new_grey_period_preview_is_atomic_and_keep_is_session_specific(self):
+        from .models import ProtectedPeriod
+        session = self.published()
+        before = len(self.writes)
+        body = self.period_body()
+        preview = self.client.post('/api/calendar/protected-periods/', body, format='json')
+        self.assertEqual(preview.status_code, 409, preview.data)
+        self.assertTrue(preview.data['review_required'])
+        self.assertEqual(str(preview.data['affected_sessions'][0]['session_id']), str(session.pk))
+        self.assertFalse(ProtectedPeriod.objects.filter(title='New job').exists())
+        saved = self.client.post('/api/calendar/protected-periods/', {**body,
+            'conflict_resolution': 'keep', 'impact_token': preview.data['impact_token']}, format='json')
+        self.assertEqual(saved.status_code, 201, saved.data)
+        session.refresh_from_db()
+        self.assertEqual(session.status, 'published')
+        self.assertEqual(len(session.grey_exceptions), 1)
+        self.assertEqual(len(self.writes), before)
+        impacts = self.client.get(f"/api/calendar/protected-periods/{saved.data['id']}/impacts/")
+        self.assertEqual(impacts.status_code, 200, impacts.data)
+        self.assertTrue(impacts.data['affected_sessions'][0]['exception_kept'])
+        refreshed = self.client.post(f'/api/sessions/{session.pk}/refresh/')
+        self.assertFalse(any(issue.startswith('outside_availability:') for issue in refreshed.data['sync_issues']))
+
+    def test_review_choice_flags_session_without_moving_it(self):
+        session = self.published()
+        preview = self.client.post('/api/calendar/protected-periods/', self.period_body(), format='json')
+        result = self.client.post('/api/calendar/protected-periods/', {**self.period_body(),
+            'conflict_resolution': 'review', 'impact_token': preview.data['impact_token']}, format='json')
+        self.assertEqual(result.status_code, 201, result.data)
+        session.refresh_from_db()
+        self.assertEqual(session.starts_at, self.start)
+        self.assertEqual(session.sync_status, 'review')
+        self.assertFalse(session.grey_exceptions)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_stale_impact_token_does_not_save_a_period(self):
+        from .models import ProtectedPeriod
+        session = self.published()
+        preview = self.client.post('/api/calendar/protected-periods/', self.period_body(), format='json')
+        session.management_version += 1
+        session.save()
+        result = self.client.post('/api/calendar/protected-periods/', {**self.period_body(),
+            'conflict_resolution': 'keep', 'impact_token': preview.data['impact_token']}, format='json')
+        self.assertEqual(result.status_code, 409)
+        self.assertFalse(ProtectedPeriod.objects.exists())
+        self.assertEqual(len(self.writes), 1)
+
+    def test_period_edit_requires_review_and_can_keep_only_selected_appointments(self):
+        from tasks.models import Task
+        from .models import ProtectedPeriod, WorkSession
+        import uuid
+        first = self.published()
+        other = Task.objects.create(goal=self.goal, title='Another fixed appointment')
+        second = WorkSession.objects.create(user=self.user, task=other, status='published',
+            starts_at=self.start + timedelta(hours=1), ends_at=self.start + timedelta(hours=2),
+            expires_at=self.end, google_sub='subject', destination_calendar='target', google_event_id=uuid.uuid4().hex)
+        period = ProtectedPeriod.objects.create(user=self.user, kind='one_off', starts_at=self.start.replace(hour=18),
+                                                ends_at=self.start.replace(hour=19))
+        url = f'/api/calendar/protected-periods/{period.pk}/'
+        body = {'starts_at': self.start.isoformat(), 'ends_at': (self.start+timedelta(hours=2)).isoformat()}
+        preview = self.client.patch(url, body, format='json')
+        self.assertEqual(preview.status_code, 409, preview.data)
+        period.refresh_from_db()
+        self.assertEqual(period.starts_at.hour, 18)
+        saved = self.client.patch(url, {**body, 'conflict_resolution': 'review',
+            'impact_token': preview.data['impact_token'], 'keep_session_ids': [str(first.pk)]}, format='json')
+        self.assertEqual(saved.status_code, 200, saved.data)
+        first.refresh_from_db(); second.refresh_from_db()
+        self.assertEqual(len(first.grey_exceptions), 1)
+        self.assertFalse(second.grey_exceptions)
+        self.assertEqual(second.sync_status, 'review')
+        self.assertEqual(len(self.writes), 1)
+
+    def test_inflight_calendar_write_blocks_protected_period_change(self):
+        from .models import ProtectedPeriod
+        session = self.published()
+        session.status = 'publishing'
+        session.save()
+        result = self.client.post('/api/calendar/protected-periods/', self.period_body(), format='json')
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual(result.data['error'], 'calendar_write_unconfirmed')
+        self.assertFalse(ProtectedPeriod.objects.exists())
+
+
+class ManualGreyRescheduleTests(APITestCase):
+    setUp = SessionManagementTests.setUp
+    calendar_api = SessionManagementTests.calendar_api
+    provider = SessionManagementTests.provider
+    move = SessionManagementTests.move
+    approve_change = SessionManagementTests.approve_change
+
+    def test_selected_grey_time_needs_consent_and_does_not_grandfather_other_times(self):
+        from .models import ProtectedPeriod
+        left = self.start + timedelta(hours=2)
+        ProtectedPeriod.objects.create(user=self.user, kind='one_off', starts_at=left, ends_at=left+timedelta(hours=1))
+        result = self.move(preferred_start=left.isoformat())
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(self.approve_change(result).status_code, 409)
+        approved = self.approve_change(result, allow_overlap=True, conflict_token=result.data['change']['conflict_token'])
+        self.assertEqual(approved.status_code, 200, approved.data)
+        self.assertEqual(len(approved.data['session']['grey_exceptions']), 1)
+        self.assertEqual(len(self.writes), 1)
+        # A future automatic move gets its own independent free-slot selection.
+        fresh = self.move()
+        self.assertEqual(fresh.status_code, 201, fresh.data)
+        self.assertEqual(fresh.data['change']['time_selection'], 'automatic')
+        self.assertFalse(fresh.data['change']['conflicts'])
+
+
+class CompletionAppearanceTests(APITestCase):
+    setUp = SessionManagementTests.setUp
+    calendar_api = SessionManagementTests.calendar_api
+    provider = SessionManagementTests.provider
+
+    def report(self, status='completed'):
+        import uuid
+        self.plan.refresh_from_db()
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(f'/api/tasks/{self.task.pk}/outcomes/', {
+                'client_id': str(uuid.uuid4()), 'plan_version': self.plan.version,
+                'status': status, 'remaining_minutes': 0 if status == 'completed' else 30,
+            }, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        return response
+
+    def test_completion_restoration_and_idempotent_refresh_preserve_event(self):
+        from .completion import sync_session
+        self.event['colorId'] = '5'
+        original = self.event.copy()
+        self.report()
+        self.assertEqual(self.event['summary'], '✓ Completed: ' + self.task.title)
+        self.assertEqual(self.event['colorId'], '8')
+        self.assertEqual(self.event['start'], original['start'])
+        self.assertEqual(self.event['id'], original['id'])
+        sync_session(self.user, self.session.pk)
+        self.assertEqual(len(self.writes), 1)
+        self.report('reopened')
+        self.assertEqual(self.event['summary'], original['summary'])
+        self.assertEqual(self.event['colorId'], '5')
+        self.assertEqual(len(self.writes), 2)
+        self.session.refresh_from_db()
+        self.assertFalse(self.session.completion_presentation['completed'])
+
+    def test_uncertain_write_keeps_progress_and_recovers_without_duplicate_patch(self):
+        from .completion import sync_session
+        self.timeout_after_write = True
+        self.report()
+        self.task.refresh_from_db()
+        self.session.refresh_from_db()
+        self.assertTrue(self.task.is_completed)
+        self.assertEqual(self.session.completion_presentation['status'], 'error')
+        sync_session(self.user, self.session.pk)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.completion_presentation['status'], 'current')
+        self.assertEqual(len(self.writes), 1)
+
+    def test_manual_edit_is_preserved_on_reopen(self):
+        self.report()
+        self.event['summary'] = 'My manual title'
+        self.report('reopened')
+        self.assertEqual(self.event['summary'], 'My manual title')
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.completion_presentation['status'], 'error')
+
+    def test_partial_does_not_mark_complete_and_deleted_event_is_not_recreated(self):
+        self.report('partial')
+        self.assertFalse(self.writes)
+        self.event = None
+        self.report()
+        self.assertFalse(self.writes)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.completion_presentation['status'], 'error')
+
+    def test_refresh_backfills_legacy_completion_and_exposes_frontend_state(self):
+        self.task.is_completed = True
+        self.task.save()
+        response = self.client.post(f'/api/sessions/{self.session.pk}/refresh/')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(response.data['task_completed'])
+        self.assertEqual(response.data['completion_presentation']['status'], 'current')
+        self.assertEqual(self.event['summary'], '✓ Completed: ' + self.task.title)
+
+    def test_failed_before_write_can_retry_and_reopen_before_sync_is_safe(self):
+        from .completion import sync_session
+        self.timeout_before_write = True
+        self.report()
+        self.assertFalse(self.writes)
+        sync_session(self.user, self.session.pk)
+        self.assertEqual(len(self.writes), 1)
+        self.report('reopened')
+        self.session.completion_presentation = {'status': 'error', 'error': 'Unavailable'}
+        self.session.save(update_fields=['completion_presentation'])
+        sync_session(self.user, self.session.pk)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.completion_presentation['status'], 'current')
