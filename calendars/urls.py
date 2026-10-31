@@ -2,7 +2,7 @@ from django.urls import path
 
 from .views import AvailabilityView, CallbackView, CalendarsView, ConnectionView, ConnectView, PreferencesView
 from .views import (
-    ProtectedPeriodDetailView, ProtectedPeriodsView,
+    ProtectedPeriodDetailView, ProtectedPeriodsView, ProtectedPeriodImpactsView,
     SchedulingPreferencesView, SchedulingWindowsView,
 )
 
@@ -16,5 +16,6 @@ urlpatterns = [
     path("scheduling-preferences/", SchedulingPreferencesView.as_view(), name="scheduling-preferences"),
     path("protected-periods/", ProtectedPeriodsView.as_view(), name="protected-periods"),
     path("protected-periods/<int:period_id>/", ProtectedPeriodDetailView.as_view(), name="protected-period"),
+    path("protected-periods/<int:period_id>/impacts/", ProtectedPeriodImpactsView.as_view(), name="protected-period-impacts"),
     path("scheduling-windows/", SchedulingWindowsView.as_view(), name="scheduling-windows"),
 ]

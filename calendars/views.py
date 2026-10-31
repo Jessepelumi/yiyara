@@ -176,16 +176,8 @@ class ProtectedPeriodsView(CalendarView):
         ).data})
 
     def post(self, request):
-        serializer = ProtectedPeriodSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        with transaction.atomic():
-            services.lock_user(request.user)
-            if not SchedulingPreferences.objects.filter(user=request.user).exists():
-                raise ValidationError("Set scheduling preferences and timezone first.")
-            if ProtectedPeriod.objects.filter(user=request.user).count() >= 100:
-                raise ValidationError("Keep no more than 100 protected periods; edit or delete an existing period.")
-            period = serializer.save(user=request.user)
-        return Response(ProtectedPeriodSerializer(period).data, status=201)
+        from .protected import write
+        return Response(write(request.user, request.data), status=201)
 
 
 class ProtectedPeriodDetailView(CalendarView):
@@ -194,13 +186,8 @@ class ProtectedPeriodDetailView(CalendarView):
         return Response(ProtectedPeriodSerializer(period).data)
 
     def patch(self, request, period_id):
-        with transaction.atomic():
-            services.lock_user(request.user)
-            period = get_object_or_404(ProtectedPeriod, pk=period_id, user=request.user)
-            serializer = ProtectedPeriodSerializer(period, data=request.data, partial=True)
-            serializer.is_valid(raise_exception=True)
-            serializer.save()
-        return Response(serializer.data)
+        from .protected import write
+        return Response(write(request.user, request.data, period_id=period_id))
 
     def delete(self, request, period_id):
         with transaction.atomic():
@@ -227,3 +214,12 @@ class SchedulingWindowsView(CalendarView):
             "google_busy_time_checked": False,
             "windows": [{"starts_at": start, "ends_at": end} for start, end in windows],
         })
+
+
+class ProtectedPeriodImpactsView(CalendarView):
+    def get(self, request, period_id):
+        from .protected import impact
+        with transaction.atomic():
+            services.lock_user(request.user)
+            period = get_object_or_404(ProtectedPeriod, pk=period_id, user=request.user)
+            return Response(impact(request.user, period))
