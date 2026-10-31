@@ -2,6 +2,7 @@ from django.conf import settings
 from config.policies import EffortField, valid_effort
 from rest_framework import serializers
 from .models import Task
+from .availability import ActivityAvailabilitySerializer, normalize_availability
 
 class TaskSerializers(serializers.ModelSerializer):
     dependencies = serializers.PrimaryKeyRelatedField(many=True, read_only=True)
@@ -20,11 +21,12 @@ class TaskSerializers(serializers.ModelSerializer):
         model = Task
         fields = ['id', 'title', 'description', 'is_completed', 'due_date',
                   'estimated_minutes', 'completion_criteria', 'readiness', 'blocker_reason',
-                  'planning_context_version', 'dependencies', 'scheduling_blockers', 'is_schedulable',
+                  'planning_context_version', 'availability', 'dependencies', 'scheduling_blockers', 'is_schedulable',
                   'progress_status', 'remaining_minutes', 'progress_version', 'effective_minutes']
 
 
 class TaskWriteSerializer(TaskSerializers):
+    availability = ActivityAvailabilitySerializer(required=False)
     estimated_minutes = EffortField(allow_null=True, required=False)
     completion_criteria = serializers.CharField(max_length=5000, allow_blank=True, required=False)
     blocker_reason = serializers.CharField(max_length=2000, allow_blank=True, required=False)
@@ -68,6 +70,10 @@ class TaskWriteSerializer(TaskSerializers):
         ):
             raise serializers.ValidationError('Ready tasks require estimated_minutes and completion_criteria.')
         goal = self.context['goal']
+        if 'availability' in attrs:
+            attrs['availability'] = normalize_availability(attrs['availability'], goal.plan)
+        if value('availability', {}).get('status') == 'unknown' and value('readiness', 'draft') == 'ready':
+            raise serializers.ValidationError('Unknown activity availability must remain blocked or draft.')
         if value('readiness', 'draft') == 'ready' and value('blocker_reason', '').strip():
             raise serializers.ValidationError('Clear the external blocker before marking a task ready.')
         if goal.due_date and value('due_date') and value('due_date') > goal.due_date:

@@ -107,6 +107,8 @@ def normalize_replan(plan, operation):
         effort = task.remaining_minutes if task.remaining_minutes is not None else after['estimated_minutes']
         if after['readiness'] == 'ready' and (not effort or not after['completion_criteria'] or after['blocker_reason']):
             raise serializers.ValidationError('Ready tasks require effort and completion criteria and no external blocker.')
+        if after['readiness'] == 'ready' and (task.availability or {}).get('status') == 'unknown':
+            raise serializers.ValidationError('Confirm activity availability before marking this task ready.')
         if after['readiness'] == 'blocked' and not after['blocker_reason']:
             raise serializers.ValidationError('Blocked tasks require a blocker reason.')
         if 'depends_on' in changes:
