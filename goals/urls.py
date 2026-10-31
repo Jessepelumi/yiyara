@@ -1,5 +1,5 @@
 from django.urls import path
-from .planning_views import PlanContextView, QuestionAnswerView, TaskPlanProposalView, ReplanProposalView, UpgradeLegacyPlanView
+from .planning_views import PlanContextView, QuestionAnswerView, TaskPlanProposalView, ReplanProposalView, UpgradeLegacyPlanView, TaskReviewView
 from .views import (
     DeleteGoalView,
     GoalListView,
@@ -17,6 +17,7 @@ urlpatterns = [
     path('plans/<uuid:plan_id>/upgrade/', UpgradeLegacyPlanView.as_view(), name='plan-upgrade'),
     path('plans/<uuid:plan_id>/context/', PlanContextView.as_view(), name="plan-context"),
     path('plans/<uuid:plan_id>/tasks/propose/', TaskPlanProposalView.as_view(), name="plan-tasks-propose"),
+    path('plans/<uuid:plan_id>/tasks/review/', TaskReviewView.as_view(), name='plan-tasks-review'),
     path('plans/<uuid:plan_id>/replan/', ReplanProposalView.as_view(), name="plan-replan"),
     path('plans/<uuid:plan_id>/questions/<uuid:question_id>/answer/', QuestionAnswerView.as_view(), name="question-answer"),
     path(

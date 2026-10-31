@@ -18,6 +18,7 @@ from ai.prompts.task_planning_prompt import TASK_PLANNING_SCHEMA, TASK_PLANNING_
 from ai.providers.base import AIConfigurationError
 from tasks.dependencies import plan_graph, validate_graph
 from tasks.models import Task, TaskDependency
+from tasks.availability import ActivityAvailabilitySerializer, normalize_availability
 from .models import Goal, Plan
 
 
@@ -39,6 +40,7 @@ class StrictSerializer(serializers.Serializer):
 
 
 class ProposedTaskSerializer(StrictSerializer):
+    availability = ActivityAvailabilitySerializer(required=False, default=dict)
     key = serializers.RegexField(r'^[a-z][a-z0-9_]{0,39}$')
     title = serializers.CharField(max_length=255)
     description = serializers.CharField(max_length=5000)
@@ -49,6 +51,8 @@ class ProposedTaskSerializer(StrictSerializer):
     depends_on = serializers.ListField(child=serializers.CharField(max_length=64), max_length=50, default=list)
 
     def validate(self, attrs):
+        if attrs['availability'].get('status') == 'unknown' and attrs['readiness'] == 'ready':
+            raise serializers.ValidationError('Unknown activity availability cannot be marked ready.')
         if attrs['readiness'] == 'ready' and (not attrs['estimated_minutes'] or attrs['blocker_reason']):
             raise serializers.ValidationError('Ready tasks need effort and cannot have an external blocker.')
         if attrs['readiness'] == 'blocked' and not attrs['blocker_reason']:
@@ -121,6 +125,8 @@ def normalize_batch(plan, operation, *, existing_graph=None, unfinished_signatur
             raise serializers.ValidationError('Group tasks for the same goal together.')
         seen_goals.add(identity)
         for task in goal['tasks']:
+            if task['availability']:
+                task['availability'] = normalize_availability(task['availability'], plan)
             signature = (task['title'].casefold(), task['completion_criteria'].casefold())
             if signature in duplicates:
                 raise serializers.ValidationError('This proposal duplicates unfinished work.')
@@ -161,7 +167,7 @@ def apply_batch(plan, operation):
             created[data['key']] = Task.objects.create(
                 goal=goal, title=data['title'], description=data['description'], completion_criteria=data['completion_criteria'],
                 estimated_minutes=data['estimated_minutes'], readiness=data['readiness'], blocker_reason=data['blocker_reason'],
-                planning_context_version=plan.context_version,
+                planning_context_version=plan.context_version, availability=data['availability'],
             )
     for goal_data in operation['goals']:
         for data in goal_data['tasks']:
@@ -202,13 +208,15 @@ def validate_result(plan, payload):
     return {'reply': reply, 'summary': summary, 'goals': operation['goals'] if operation else []}
 
 
-def propose_tasks(user, plan_id, data, *, replanning=False):
+def propose_tasks(user, plan_id, data, *, replanning=False, reviewing=False):
     from conversations.models import Conversation, Message
     from .services import PlanVersionConflict, create_plan_change, serialize_plan_snapshot
 
     from conversations.requests import retryable, claim, ensure_current, complete, fail
 
-    source = 'task_replanning' if replanning else 'task_planning'
+    source = 'task_review' if reviewing else ('task_replanning' if replanning else 'task_planning')
+    requested_ids = sorted(str(pk) for pk in data.get('task_ids', []))
+    review_ids = []
     validate_payload = validate_result
     system_prompt, schema = TASK_PLANNING_SYSTEM_PROMPT, TASK_PLANNING_SCHEMA
     if replanning:
@@ -217,13 +225,19 @@ def propose_tasks(user, plan_id, data, *, replanning=False):
         validate_payload = validate_replan_result
         system_prompt, schema = REPLANNING_SYSTEM_PROMPT, REPLANNING_SCHEMA
 
+    if reviewing:
+        from .task_review import TASK_REVIEW_SCHEMA, TASK_REVIEW_SYSTEM_PROMPT
+        system_prompt, schema = TASK_REVIEW_SYSTEM_PROMPT, TASK_REVIEW_SCHEMA
+        replanning = True
+
     with transaction.atomic():
         get_user_model().objects.select_for_update().get(pk=user.pk)
         plan = get_object_or_404(Plan.objects.select_for_update(), pk=plan_id, user=user)
         conversation, _ = Conversation.objects.get_or_create(plan=plan, defaults={'user': user})
         existing = conversation.messages.filter(client_id=data['client_id'], role='user').first()
         if existing:
-            if existing.metadata.get('source') != source or existing.metadata.get('focus') != data['focus']:
+            if (existing.metadata.get('source') != source or existing.metadata.get('focus') != data['focus']
+                    or (reviewing and existing.metadata.get('task_ids', []) != requested_ids)):
                 raise PlanVersionConflict('This client_id belongs to a different request.')
             assistant = conversation.messages.filter(role='assistant', metadata__request_client_id=str(data['client_id'])).first()
             if assistant:
@@ -234,13 +248,17 @@ def propose_tasks(user, plan_id, data, *, replanning=False):
         if plan.version != data['plan_version']:
             raise PlanVersionConflict('Plan changed. Refresh before requesting tasks.')
         ensure_plannable(plan)
+        if reviewing:
+            from .task_review import selected_ids, validate_review_result
+            review_ids = selected_ids(plan, requested_ids)
+            validate_payload = lambda current, payload: validate_review_result(current, payload, review_ids)
         message = existing or Message.objects.create(
             conversation=conversation, role='user', content=data['focus'] or (
                 'Review unfinished tasks using saved context and reported progress.' if replanning
                 else 'Propose the next actionable tasks from saved context.'),
             client_id=data['client_id'],
         )
-        claim(message, {'source': source, 'focus': data['focus']})
+        claim(message, {'source': source, 'focus': data['focus'], **({'task_ids': requested_ids} if reviewing else {})})
         captured_version = plan.version
         snapshot = serialize_plan_snapshot(plan)
         if replanning:
@@ -255,13 +273,14 @@ def propose_tasks(user, plan_id, data, *, replanning=False):
             'current_local_time': timezone.now().astimezone(zone).isoformat(), 'timezone': str(zone),
             'timezone_is_fallback': profile is None, 'persistent_plan': snapshot, 'focus': data['focus'],
             'near_term_horizon_days': settings.PLAN_NEAR_TERM_DAYS,
-            'scheduling_preferences': {'working_hours': profile.working_hours,
+            **({'review_task_ids': review_ids} if reviewing else {}),
+            'scheduling_preferences': {'availability_basis': 'all_time_except_protected_periods',
                                        'preferred_session_minutes': profile.preferred_session_minutes} if profile else None,
         }, ensure_ascii=False)
         gateway = get_ai_gateway()
         payload = gateway.generate_json(
             task=AITask.TASK_PLANNING, prompt=prompt, system_prompt=render_prompt(system_prompt),
-            response_schema=schema, schema_name='task_replanning' if replanning else 'next_actionable_tasks', temperature=0.1,
+            response_schema=schema, schema_name='task_review' if reviewing else ('task_replanning' if replanning else 'next_actionable_tasks'), temperature=0.1,
             max_output_tokens=settings.AI_MAX_OUTPUT_TOKENS, timeout_seconds=settings.AI_REQUEST_TIMEOUT_SECONDS,
             validator=lambda result: validate_payload(plan, result),
         )
@@ -282,6 +301,7 @@ def propose_tasks(user, plan_id, data, *, replanning=False):
             assistant = Message.objects.create(conversation=conversation, role='assistant', content=payload['reply'], metadata={
                 'source': source, 'request_client_id': str(data['client_id']),
                 'change_id': str(change.pk) if change else None,
+                **({'assessment': payload['assessment'], 'reviewed_task_ids': review_ids} if reviewing else {}),
             })
             complete(message)
         return assistant, change, False

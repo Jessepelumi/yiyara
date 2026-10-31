@@ -85,6 +85,7 @@ class TaskPlanProposalView(APIView):
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = 'task_planning'
     replanning = False
+    reviewing = False
 
     def post(self, request, plan_id):
         from ai.providers.base import AIConfigurationError
@@ -92,14 +93,19 @@ class TaskPlanProposalView(APIView):
         from .serializers import PlanChangeSerializer
         from .task_planning import TaskPlanningError, TaskPlanningRequestSerializer, propose_tasks
 
-        serializer = TaskPlanningRequestSerializer(data=request.data)
+        if self.reviewing:
+            from .task_review import TaskReviewRequestSerializer
+            serializer = TaskReviewRequestSerializer(data=request.data)
+        else:
+            serializer = TaskPlanningRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
-            assistant, change, replayed = propose_tasks(request.user, plan_id, serializer.validated_data, replanning=self.replanning)
+            assistant, change, replayed = propose_tasks(request.user, plan_id, serializer.validated_data, replanning=self.replanning, reviewing=self.reviewing)
             return Response({
                 'reply': assistant.content, 'message_id': assistant.pk,
                 'change': PlanChangeSerializer(change).data if change else None,
                 'replayed': replayed,
+                **({'assessment': assistant.metadata['assessment'], 'reviewed_task_ids': assistant.metadata['reviewed_task_ids']} if self.reviewing else {}),
             }, status=200 if replayed else 201)
         except PlanVersionConflict as exc:
             return Response({'error': 'plan_version_conflict', 'message': str(exc)}, status=409)
@@ -134,3 +140,7 @@ class UpgradeLegacyPlanView(APIView):
             plan.save()
             create_plan_revision(plan, 'Upgraded legacy board to contextual planning; tasks require review')
         return Response(PlanSerializer(plan).data)
+
+
+class TaskReviewView(TaskPlanProposalView):
+    reviewing = True

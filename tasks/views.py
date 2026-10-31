@@ -28,7 +28,7 @@ class TaskCreateView(CalendarView):
             plan.version += 1
             plan.save(update_fields=['version', 'updated_at'])
             create_plan_revision(plan, 'Created task manually')
-        return Response(TaskWriteSerializer(task).data, status=201)
+        return Response({**TaskWriteSerializer(task).data, 'plan_version': plan.version, 'review_recommended': True}, status=201)
 
 
 class TaskDetailView(CalendarView):

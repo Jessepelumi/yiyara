@@ -71,7 +71,7 @@ class PlanMessagesView(APIView):
                 role=Message.Role.USER,
             ).first()
             if existing:
-                if existing.metadata.get('source') in ('task_planning', 'task_replanning'):
+                if existing.metadata.get('source') in ('task_planning', 'task_replanning', 'task_review'):
                     return Response({'error': 'client_id_conflict', 'message': 'Retry this client_id on the endpoint where it was created.'}, status=409)
                 if existing.content != data["content"]:
                     return Response({"error": "client_id_conflict", "message": "This client_id belongs to different content."}, status=409)
