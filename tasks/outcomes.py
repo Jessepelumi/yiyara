@@ -98,6 +98,9 @@ def append_report(task, plan, data, *, source='outcome'):
     WorkSession.objects.filter(user_id=plan.user_id, task_snapshot__task_id=str(task.pk), status='proposed').update(status='rejected')
     SessionChange.objects.filter(user_id=plan.user_id, session__task_snapshot__task_id=str(task.pk),
                                  kind='reschedule', status='proposed').update(status='rejected')
+    if data['status'] in ('completed', 'reopened'):
+        from calendars.completion import queue_task
+        queue_task(plan.user, task)
     return outcome
 
 

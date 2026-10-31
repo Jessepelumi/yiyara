@@ -1,4 +1,5 @@
-"""Read external changes without overwriting Google or inferring task progress."""
+from . import conflicts
+"""Observe external changes; retry explicit completion appearance without inferring progress."""
 from django.conf import settings
 import copy
 from datetime import timedelta
@@ -32,7 +33,7 @@ def check_idle(session, allow_change=None):
 def summary(event):
     """Store useful event data, excluding attendees and arbitrary private metadata."""
     result = {key: copy.deepcopy(event[key]) for key in (
-        'id', 'etag', 'status', 'summary', 'description', 'start', 'end', 'transparency', 'visibility',
+        'id', 'etag', 'status', 'summary', 'description', 'start', 'end', 'transparency', 'visibility', 'colorId',
     ) if key in event}
     result['recurring'] = bool(event.get('recurrence') or event.get('recurringEventId'))
     result['has_guests'] = bool(event.get('attendees'))
@@ -103,13 +104,16 @@ def observe(user, session_id, expected, code, event, *, allow_change=None):
                         session.event_payload.pop(key, None)
                 profile = SchedulingPreferences.objects.filter(user=user).first()
                 bounded = timedelta(minutes=settings.MIN_SESSION_MINUTES) <= right - left <= timedelta(minutes=settings.MAX_SESSION_MINUTES)
-                windows = permitted_windows(user, left, right) if profile and bounded else None
+                windows = permitted_windows(user, left, right, ignore_grey=True) if profile and bounded else None
                 if not bounded:
                     issues.append(f'unsupported_duration: external session is outside {settings.MIN_SESSION_MINUTES}–{settings.MAX_SESSION_MINUTES} minutes')
                 elif windows is None:
                     issues.append('missing_preferences: set scheduling preferences before evaluating this external time')
-                elif not any(a <= left and b >= right for a, b in windows):
-                    issues.append('outside_availability: external time overlaps grey periods or lies outside scheduling hours')
+                else:
+                    from .scheduling import grey_details
+                    grey = conflicts.reviewed(grey_details(user, left, right), left, right)
+                    if any(not conflicts.has_grey_exception(session, item) for item in grey):
+                        issues.append('outside_availability: external time overlaps protected grey periods without an approved exception')
                 task = Task.objects.select_related('goal__plan').filter(pk=session.task_snapshot.get('task_id'), goal__user=user).first()
                 due = sessions.deadline(task, profile) if task and profile else None
                 if due and right > due:
@@ -122,6 +126,13 @@ def observe(user, session_id, expected, code, event, *, allow_change=None):
                             issues.append('outside_ambition_rules: external time violates confirmed ambition timing')
                     except APIException:
                         issues.append('ambition_rules_pending: confirm the saved ambition timing before relying on this session')
+                    from tasks.availability import apply_task_windows
+                    try:
+                        activity_windows = apply_task_windows(task, profile, left, right, windows or [])
+                        if not any(a <= left and b >= right for a, b in activity_windows):
+                            issues.append('outside_activity_availability: external time violates the task activity hours')
+                    except APIException:
+                        issues.append('activity_availability_pending: confirm activity availability before relying on this session')
 
                 if changed_time:
                     # Prior overlap consent belongs to its original time, never a new Google time.
@@ -162,7 +173,11 @@ def refresh(user, session_id):
         expected = token(session)
     try:
         code, event = read_verified(user, session)
-        return observe(user, session_id, expected, code, event)
+        observed = observe(user, session_id, expected, code, event)
+        from .completion import sync_session
+        sync_session(user, session_id)
+        observed.refresh_from_db()
+        return observed
     except APIException as error:
         # Never turn an access failure into deletion, or mark an old check fresh.
         with transaction.atomic():

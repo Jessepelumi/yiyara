@@ -309,3 +309,6 @@ LOGGING = {
         "django.request": {"filters": ["calendar_callback"]},
     },
 }
+
+# Google Calendar event colour 8 is graphite; override for a different completion colour.
+COMPLETED_EVENT_COLOR_ID = os.getenv("COMPLETED_EVENT_COLOR_ID", "8")

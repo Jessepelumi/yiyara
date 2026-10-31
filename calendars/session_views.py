@@ -45,7 +45,7 @@ class ConflictReviewMixin:
         if obj.conflicts:
             if obj.overlap_approved:
                 return 'Overlap was explicitly approved. Existing events remain unchanged.'
-            return 'A suitable time was found, but it is occupied. Find another slot or approve overlap; existing events will remain unchanged.'
+            return 'Your selected time conflicts with protected time or existing events. Choose another time or explicitly confirm this exception; existing events remain unchanged.'
         return 'No calendar conflict was found for this proposal.'
 
 
@@ -58,7 +58,7 @@ class SessionChangeSerializer(ConflictReviewMixin, serializers.ModelSerializer):
         model = SessionChange
         fields = ['id', 'session_id', 'client_id', 'kind', 'status', 'base_version', 'reason', 'before_event',
                   'starts_at', 'ends_at', 'expires_at', 'approved_at', 'applied_at', 'lease_until', 'last_error', 'created_at',
-                  'conflicts', 'conflict_token', 'overlap_approved', 'requires_conflict_approval', 'message']
+                  'time_selection', 'conflicts', 'conflict_token', 'overlap_approved', 'requires_conflict_approval', 'message']
         read_only_fields = fields
 
 
@@ -70,6 +70,11 @@ class ReconciliationSerializer(serializers.ModelSerializer):
 
 
 class SessionSerializer(ConflictReviewMixin, serializers.ModelSerializer):
+    task_completed = serializers.SerializerMethodField()
+
+    def get_task_completed(self, obj):
+        return bool(obj.task_id and obj.task.is_completed)
+
     changes = SessionChangeSerializer(many=True, read_only=True)
     reconciliations = ReconciliationSerializer(many=True, read_only=True)
     requires_conflict_approval = serializers.SerializerMethodField()
@@ -81,7 +86,7 @@ class SessionSerializer(ConflictReviewMixin, serializers.ModelSerializer):
                   'approved_at', 'published_at', 'management_version', 'cancelled_at', 'changes',
                   'finished_at', 'finish_outcome_id', 'continuation_of', 'source_outcome_id',
                   'synced_at', 'sync_status', 'sync_error', 'sync_issues', 'remote_etag', 'remote_snapshot', 'reconciliations',
-                  'conflicts', 'conflict_token', 'overlap_approved', 'overlap_history', 'requires_conflict_approval', 'message']
+                  'task_completed', 'completion_presentation', 'time_selection', 'grey_exceptions', 'conflicts', 'conflict_token', 'overlap_approved', 'overlap_history', 'requires_conflict_approval', 'message']
         read_only_fields = fields
 
 
@@ -139,6 +144,7 @@ class FinishSessionView(CalendarView):
         serializer = FinishSessionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         session, task, plan, outcome, replayed = finish(request.user, session_id, serializer.validated_data)
+        session.refresh_from_db()
         return Response({'session': SessionSerializer(session).data, 'task': TaskWriteSerializer(task).data,
                          'outcome': TaskOutcomeSerializer(outcome).data, 'plan_version': plan.version,
                          'replayed': replayed}, status=200 if replayed else 201)
